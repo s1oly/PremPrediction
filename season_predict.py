@@ -23,7 +23,7 @@ import joblib
 from tensorflow.keras.models import load_model
 
 from data_aquisition import FDCUKDataLoader
-from prepare_model_data import convert_form, add_elo_feature
+from prepare_model_data import convert_form, add_elo_feature, add_relative_features
 from model_train import FEATURES, MAX_GAMEWEEK
 
 PREDICT_SEASON = 2025  # 2025-26 season
@@ -39,8 +39,8 @@ def pad_sequence(X: np.ndarray, max_len: int = MAX_GAMEWEEK) -> np.ndarray:
     return np.vstack([X, np.zeros((pad_len, X.shape[1]))])
 
 
-def predict_team_probability(model, scaler, team_df: pd.DataFrame) -> float:
-    """Return raw sigmoid probability for a single team's partial-season sequence."""
+def get_team_logit(model, scaler, team_df: pd.DataFrame) -> float:
+    """Return the raw logit (pre-sigmoid) for a single team's partial-season sequence."""
     team_df = team_df.sort_values("gameweek")
     X = scaler.transform(team_df[FEATURES])
     X_padded = pad_sequence(X, MAX_GAMEWEEK)
@@ -49,29 +49,31 @@ def predict_team_probability(model, scaler, team_df: pd.DataFrame) -> float:
 
 
 def predict_gameweek(
-    model, scaler, season_df: pd.DataFrame, gameweek: int
+    model, scaler, season_df: pd.DataFrame, gameweek: int,
+    temperature: float = 1.0,
 ) -> dict[str, float]:
     """
-    Predict raw probabilities for all teams up to and including gameweek.
-    Returns {teamName: raw_prob}.
+    Collect raw logits for all teams up to gameweek, then apply softmax across
+    all 20 teams to produce a proper probability distribution (sums to 1.0).
+
+    temperature < 1 sharpens the distribution (more confident);
+    temperature > 1 flattens it (more uncertain). Default 1.0 = standard softmax.
     """
-    probs = {}
     gw_df = season_df[season_df["gameweek"] <= gameweek]
-    for team in gw_df["teamName"].unique():
-        team_df = gw_df[gw_df["teamName"] == team]
-        if team_df.empty:
-            continue
-        probs[team] = predict_team_probability(model, scaler, team_df)
-    return probs
+    teams = list(gw_df["teamName"].unique())
 
+    logits = np.array([
+        get_team_logit(model, scaler, gw_df[gw_df["teamName"] == t])
+        for t in teams
+    ])
 
-def normalise(probs: dict[str, float]) -> dict[str, float]:
-    """Normalise raw probabilities to sum to 100%."""
-    total = sum(probs.values())
-    if total == 0:
-        n = len(probs)
-        return {t: 1.0 / n for t in probs}
-    return {t: v / total for t, v in probs.items()}
+    # Softmax across all 20 teams — the model now treats this as a
+    # 20-way ranking problem, not 20 independent binary predictions.
+    logits_scaled = logits / temperature
+    exp_logits = np.exp(logits_scaled - logits_scaled.max())  # numerically stable
+    probs = exp_logits / exp_logits.sum()
+
+    return dict(zip(teams, probs))
 
 
 def format_kalshi(probs: dict[str, float], gameweek: int) -> str:
@@ -99,9 +101,9 @@ def prepare_current_season(all_history_df: pd.DataFrame) -> pd.DataFrame:
     combined = pd.concat([all_history_df, cur_df], ignore_index=True)
     combined = convert_form(combined)
     combined = add_elo_feature(combined)
-    # games_remaining column (labels not needed for prediction)
     combined["games_remaining"] = 38 - combined["gameweek"]
     combined["won_league"] = 0  # placeholder
+    combined = add_relative_features(combined)
 
     return combined[combined["season"] == PREDICT_SEASON].copy()
 
@@ -129,20 +131,17 @@ def main():
         if len(teams_at_gw) == 0:
             continue
 
-        raw_probs = predict_gameweek(model, scaler, season_df, gw)
-        norm_probs = normalise(raw_probs)
-        all_output.append(format_kalshi(norm_probs, gw))
+        probs = predict_gameweek(model, scaler, season_df, gw)
+        all_output.append(format_kalshi(probs, gw))
 
     print("\n".join(all_output))
 
     # Also print the latest gameweek as a clean summary
-    latest_gw = max_gw
-    raw = predict_gameweek(model, scaler, season_df, latest_gw)
-    norm = normalise(raw)
+    latest_probs = predict_gameweek(model, scaler, season_df, max_gw)
     print("\n" + "=" * 40)
-    print(f"CURRENT STANDINGS (after GW {latest_gw})")
+    print(f"CURRENT STANDINGS (after GW {max_gw})")
     print("=" * 40)
-    for team, prob in sorted(norm.items(), key=lambda x: x[1], reverse=True):
+    for team, prob in sorted(latest_probs.items(), key=lambda x: x[1], reverse=True):
         bar = "█" * int(prob * 40)
         print(f"  {team:<22} {prob * 100:5.1f}%  {bar}")
 

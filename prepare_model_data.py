@@ -128,6 +128,33 @@ def add_labels(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_relative_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add three gameweek-relative features that encode each team's standing
+    compared to the rest of the table at the same snapshot.
+
+    points_per_game      — scoring pace; directly comparable across GWs
+    points_gap_from_leader — 0 for the leader, negative for everyone else;
+                             captures how far back a team actually is
+    max_obtainable_points — points + games_remaining * 3; teams mathematically
+                            eliminated from the title get a low ceiling early
+    """
+    df = df.copy()
+
+    df["points_per_game"] = df["points"] / df["gameweek"].clip(lower=1)
+
+    # Leader's points at each (season, gameweek) snapshot
+    leader_pts = (
+        df.groupby(["season", "gameweek"])["points"]
+        .transform("max")
+    )
+    df["points_gap_from_leader"] = df["points"] - leader_pts  # <= 0
+
+    df["max_obtainable_points"] = df["points"] + df["games_remaining"] * 3
+
+    return df
+
+
 def convert_form(df: pd.DataFrame) -> pd.DataFrame:
     """Convert the string form column to a numerical score in-place."""
     df = df.copy()
@@ -136,10 +163,11 @@ def convert_form(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def prepare(df: pd.DataFrame) -> pd.DataFrame:
-    """Full preprocessing pipeline: form → labels → ELO."""
+    """Full preprocessing pipeline: form → labels → ELO → relative features."""
     df = convert_form(df)
     df = add_labels(df)
     df = add_elo_feature(df)
+    df = add_relative_features(df)
     return df
 
 
