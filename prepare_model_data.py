@@ -61,17 +61,16 @@ def _get_prev_final_standings(df: pd.DataFrame, prev_season: int) -> dict[str, i
 
 def add_elo_feature(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute the ELO feature for every (season, team) pair and broadcast it
-    across all gameweeks. ELO is constant within a season for a given team.
+    Compute a dynamic ELO feature for every row.
 
-    Formula (per trophy_data.compute_elo):
-        elo_raw = prev_position / (1 + trophies_won / possible_trophies)
-        feature  = 1 / elo_raw   (higher = stronger)
+    base_elo  = 1 / (prev_position / (1 + trophies / possible))
+                Encodes prior-season quality (constant within a season per team).
 
-    possible_trophies is 3 (PL + FA Cup + League Cup) for teams that did not
-    enter European competition, and 4 for those that did.  European participation
-    is approximated: previous-season top-7 finishers are assumed to have entered
-    a UEFA competition.
+    dynamic   = base_elo * (100 / current_position)
+                Scales the base each gameweek by the team's live table position,
+                so ELO rises as a team climbs and falls as they drop.
+
+    Higher ELO always means a stronger team.
     """
     df = df.copy()
     df["elo"] = _DEFAULT_ELO  # safe fallback
@@ -83,18 +82,17 @@ def add_elo_feature(df: pd.DataFrame) -> pd.DataFrame:
         for team in df[df["season"] == season]["teamName"].unique():
             prev_pos = prev_standings.get(team, 20)
 
-            # Derive possible_trophies: +1 if team was in European competition
             possible = 3
             if prev_pos <= 7:
                 possible = 4
-            # FA Cup / League Cup winners also get Europe even if pos > 7
-            # We correct here: if they won domestic cup, check trophy data
             t_won, t_possible = get_trophies(team, prev_season)
-            # t_possible already reflects European wins; take the max
             possible = max(possible, t_possible)
 
-            elo_val = compute_elo(prev_pos, t_won, possible)
-            df.loc[(df["season"] == season) & (df["teamName"] == team), "elo"] = elo_val
+            base_elo = compute_elo(prev_pos, t_won, possible)
+
+            # Apply dynamic scaling using live position each gameweek
+            mask = (df["season"] == season) & (df["teamName"] == team)
+            df.loc[mask, "elo"] = base_elo * (100 / df.loc[mask, "position"])
 
     return df
 
