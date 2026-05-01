@@ -30,7 +30,7 @@ class FDCUKDataLoader:
         try:
             resp = requests.get(url, timeout=15)
             resp.raise_for_status()
-            df = pd.read_csv(io.StringIO(resp.text))
+            df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
             needed = ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR"]
             missing = [c for c in needed if c not in df.columns]
             if missing:

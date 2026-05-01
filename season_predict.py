@@ -42,7 +42,7 @@ def pad_sequence(X: np.ndarray, max_len: int = MAX_GAMEWEEK) -> np.ndarray:
 def predict_team_probability(model, scaler, team_df: pd.DataFrame) -> float:
     """Return raw sigmoid probability for a single team's partial-season sequence."""
     team_df = team_df.sort_values("gameweek")
-    X = scaler.transform(team_df[FEATURES].values)
+    X = scaler.transform(team_df[FEATURES])
     X_padded = pad_sequence(X, MAX_GAMEWEEK)
     X_input = np.expand_dims(X_padded, axis=0)
     return float(model.predict(X_input, verbose=0)[0][0])
