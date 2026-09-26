@@ -1,167 +1,171 @@
 # Premier League Title Prediction
 
-An LSTM-based model that estimates each club's probability of winning the Premier League title, updated week-by-week throughout the season. Outputs are formatted in **Kalshi-style percentages** — one probability per team per gameweek.
+An LSTM model that estimates each club's probability of winning the Premier League
+title, updated week-by-week through the season. Outputs are **Kalshi-style
+percentages** — one probability per team per gameweek, softmaxed across the 20 clubs
+so they always sum to 100%.
+
+![Title race animation](outputs/title_race.gif)
+
+> The GIF above regenerates every gameweek. An interactive version (crosshair
+> tooltips, per-team table, dark mode) is built at `outputs/dashboard.html`.
 
 ---
 
 ## How It Works
 
 ### Data
-Historical match results are downloaded from **[football-data.co.uk](https://www.football-data.co.uk/)** — a free source covering every Premier League season from 1993-94 onwards (~32 seasons). No API key required.
+Match results are downloaded from **[football-data.co.uk](https://www.football-data.co.uk/)**
+— free, no API key, every PL season from 1993-94 onwards. From the raw fixtures the
+pipeline derives two things:
 
-From the raw match results the pipeline computes cumulative per-game standings for each team: points, goals, form, and position after every game played.
+- **`data/historical_matches.csv`** — one row per fixture (the Elo engine's input)
+- **`data/historical_standings.csv`** — one row per team per game played (points,
+  goals, form, live position after every game)
 
 ### Features
-Each row represents a team's state after their Nth game of the season. Features are split into three groups:
+Each row is a team's state after their Nth game of the season.
 
-**Absolute stats** — the team's raw accumulated numbers:
+**Absolute** — `position`, `form` (last-5 as W=3/D=1/L=0), `won`/`draw`/`lost`,
+`points`, `goalsFor`/`goalsAgainst`/`goalDifference`, `games_remaining`.
 
-| Feature | Description |
-|---|---|
-| `position` | Current league position |
-| `form` | Numerical score of last 5 results (W=3, D=1, L=0) |
-| `won` / `draw` / `lost` | Cumulative game counts |
-| `points` | Cumulative points |
-| `goalsFor` / `goalsAgainst` / `goalDifference` | Cumulative goal stats |
-| `games_remaining` | 38 − gameweek |
+**Relative** — `points_per_game`, `points_gap_from_leader` (0 for the leader,
+negative otherwise), `max_obtainable_points` (`points + games_remaining × 3`, the
+title ceiling).
 
-**Relative stats** — how the team stands compared to the rest of the table at that gameweek:
+**`elo`** — a results-based strength rating (below).
 
-| Feature | Description |
-|---|---|
-| `points_per_game` | `points / gameweek` — scoring pace, comparable across all stages |
-| `points_gap_from_leader` | Team's points minus the leader's points (0 for leader, negative otherwise) |
-| `max_obtainable_points` | `points + games_remaining × 3` — mathematical title ceiling |
-
-These give the model context within each snapshot, so a team 8 points clear looks very different from a team 8 points adrift, even if their absolute stats are similar.
-
-**ELO** — a dynamic prior-season strength signal:
-
-| Feature | Description |
-|---|---|
-| `elo` | Season-opening quality score, updated each gameweek by live position |
-
-### ELO Feature
-Encodes how strong a team was entering the season, anchored to their previous year's performance:
+### Elo — results-based, with prestige seeding
+The Elo is a proper chained rating updated after **every match** across all history,
+like [clubelo](http://clubelo.com/) / FiveThirtyEight:
 
 ```
-base_elo = 1 / (prev_position / (1 + trophies_won / possible_trophies))
-elo      = base_elo × (100 / current_position)
+expected_home = 1 / (1 + 10^((elo_away − (elo_home + home_adv)) / 400))
+delta         = K × goal_diff_multiplier × (result − expected_home)
+elo_home += delta ;  elo_away −= delta
 ```
 
-- `prev_position`: final league position from the prior season (20 for promoted teams)
-- `trophies_won`: PL + FA Cup + League Cup + European trophies won that season
-- `possible_trophies`: 3 domestic + 1 if in European competition (top-7 finish → Europe)
-- `current_position`: live table position at that gameweek — makes ELO dynamic throughout the season
+Because it only ever sees match results, it is **completely competition-agnostic** —
+a team is never penalised for playing in more competitions.
 
-Higher ELO = stronger team. A title-winning, trophy-laden side that is currently top of the table gets the highest possible score.
+The context you *do* want — European pedigree and trophies — is folded in
+**additively** at the start of each season, on top of the mean-reverted carryover:
+
+```
+season_start_elo = 1500 + 0.75 × (prev_end_elo − 1500)      # mean reversion
+                 + european_qualification_bonus(prev_finish) # >0 even with no trophies
+                 + trophy_bonus(prev_season)                 # stacks per trophy
+```
+
+- **European qualification bonus** rewards finishing high enough to reach Europe on
+  its own: CL (~top 5) `+40`, EL (~6th) `+25`, ECL (~7th) `+15`.
+- **Trophy bonus** stacks per trophy won: PL `+50`, CL `+50`, EL `+30`, FA `+20`,
+  League Cup `+15`, ECL `+15`.
+
+Every term is additive, so being in more competitions — or winning more of them —
+can only ever *raise* a team's Elo. All constants live at the top of
+[`src/prem_prediction/elo.py`](src/prem_prediction/elo.py) for tuning.
+
+> **Why this replaced the old formula.** The previous "elo" divided trophies won by
+> the number of competitions entered. Reaching Europe raised that denominator, so a
+> side strong enough to qualify got a *lower* prior than an identical non-European
+> trophy winner — it punished teams for being in more competitions. It also
+> multiplied by `100 / current_position`, which just duplicated the `position`
+> feature. Both problems are gone.
 
 ### Model
-A two-layer **LSTM** with masking and dropout:
+A two-layer LSTM with masking and dropout:
 
 ```
 Masking → LSTM(64) → Dropout(0.3) → LSTM(32) → Dropout(0.3) → Dense(1)
 ```
 
-The output layer produces a **raw logit** (no sigmoid). At prediction time, logits from all 20 teams are collected and passed through **softmax** together, treating the problem as a 20-way ranking rather than 20 independent binary predictions. This ensures the model inherently knows only one team can win.
+The output is a **raw logit** (no sigmoid). At prediction time the 20 teams' logits
+are collected and passed through **softmax together**, so the model learns a 20-way
+ranking (only one team can win) rather than 20 independent binaries. Trained with
+`BinaryCrossentropy(from_logits=True)`.
 
-Loss during training: `BinaryCrossentropy(from_logits=True)` — mathematically identical to sigmoid + BCE but numerically more stable.
+**Partial-sequence training:** sequences are cut at gameweeks 5, 10, … 38 and
+zero-padded, giving 8 training examples per team per season so the model makes
+confident calls early, not just at the final whistle.
 
-### Partial-Sequence Training
-The model is trained on sequences cut off at gameweeks 5, 10, 15, 20, 25, 30, 35, and 38 — with zero-padding for the remaining weeks. This gives the model 8 training examples per team per season instead of 1, teaching it to make confident predictions from early in the season rather than only at the end.
+---
+
+## Project Layout
+
+```
+src/prem_prediction/     # the package
+  data_acquisition.py    #   download fixtures, build standings
+  elo.py                 #   results-based Elo + prestige seeding
+  trophy_data.py         #   historical trophy winners + bonus values
+  prepare_model_data.py  #   form, labels, relative features, Elo merge
+  model_train.py         #   LSTM training
+  season_predict.py      #   current-season Kalshi predictions → predictions.json
+  viz.py                 #   title_race.gif + dashboard.html
+  build_dataset.py       #   full historical rebuild
+  add_season.py          #   append a finished season
+  update.py              #   gameweek refresh (predict + viz)
+  config.py / paths.py   #   season detection, filesystem paths
+scripts/update.py        # thin wrapper: python scripts/update.py
+data/                    # matches, standings, out.csv
+models/                  # best_model.h5, scaler.joblib
+outputs/                 # predictions.json, title_race.gif, dashboard.html
+```
+
+The current season is detected automatically from the date (`config.current_season_start_year`),
+so nothing is hard-coded to a particular year.
 
 ---
 
 ## Setup
 
 ```bash
-pip install tensorflow scikit-learn pandas numpy requests joblib
+pip install -r requirements.txt
+pip install -e .          # makes `python -m prem_prediction.*` work
 ```
-
----
 
 ## Running the Pipeline
 
-### Step 1 — Build the training dataset
-Downloads all seasons 1993-94 → 2024-25, computes standings, adds all features and labels.
+```bash
+# 1. Build the training dataset (downloads 1993-94 → latest completed season)
+python -m prem_prediction.build_dataset
+
+# 2. Train the model
+python -m prem_prediction.model_train
+
+# 3. Predict the current season + build the graph/dashboard
+python -m prem_prediction.update
+```
+
+`update` is the one you re-run each gameweek: it pulls the latest results, re-scores
+every completed gameweek, and rebuilds `outputs/title_race.gif` and
+`outputs/dashboard.html`. It does **not** retrain — that only happens once a season,
+after it completes.
+
+## Adding a Finished Season
+
+When a season ends, append it and retrain:
 
 ```bash
-python build_dataset.py
+python -m prem_prediction.add_season --season 2025 \
+    --pl Arsenal --fa "Man City" --lc "Man City" \
+    --cl None --el "Aston Villa" --ecl "Crystal Palace"
+python -m prem_prediction.model_train
 ```
 
-Outputs:
-- `historical_standings.csv` — raw per-game standings
-- `out.csv` — processed training data ready for the model
+Team names must match the football-data.co.uk convention exactly
+(`"Man City"`, `"Nott'm Forest"`, …).
 
-### Step 2 — Train the model
-```bash
-python model_train.py
-```
+## Automated Weekly Refresh
 
-Outputs:
-- `best_model.h5` — best LSTM checkpoint (monitored on validation loss)
-- `scaler.joblib` — fitted StandardScaler
-
-### Step 3 — Generate 2025-26 predictions
-```bash
-python season_predict.py
-```
-
-Prints Kalshi-style win probabilities for every completed gameweek of the current season, e.g.:
-
-```
-=== Gameweek 15 ===
-  Arsenal                41.3%
-  Liverpool              22.1%
-  Man City               14.8%
-  Chelsea                 7.2%
-  ...
-```
+A scheduled cloud agent can run the refresh for you every week and push the updated
+graph to the repo. It needs GitHub connected to your Claude account
+(`/web-setup` or https://claude.ai/connect-github) and the code pushed to `main`.
 
 ---
 
-## Adding a Newly Finished Season
+## Configuration Notes
 
-When a season ends, run `add_season.py` to append its standings to the training set and patch `trophy_data.py` with that year's trophy winners. The new features are computed automatically — no other changes needed.
-
-**Interactive (will prompt for each trophy winner):**
-```bash
-python add_season.py --season 2025
-```
-
-**Non-interactive:**
-```bash
-python add_season.py --season 2025 \
-    --pl Liverpool --fa "Crystal Palace" --lc Liverpool \
-    --cl None --el Tottenham --ecl None
-```
-
-Then retrain:
-```bash
-python model_train.py
-python season_predict.py
-```
-
----
-
-## Trophy Data
-
-`trophy_data.py` holds hard-coded historical trophy winners (PL, FA Cup, League Cup, Champions League, Europa League, Conference League) from 1992-93 to 2024-25, keyed by **season start year**.
-
-All team names must match the football-data.co.uk convention exactly:
-`"Man City"`, `"Man United"`, `"Nott'm Forest"`, `"Sheffield United"`, etc.
-
----
-
-## File Reference
-
-| File | Purpose |
-|---|---|
-| `build_dataset.py` | Downloads all history and builds `out.csv` |
-| `data_aquisition.py` | `FDCUKDataLoader` — free historical CSV fetcher |
-| `trophy_data.py` | Historical trophy data + ELO formula |
-| `prepare_model_data.py` | ELO, relative features, form conversion, label assignment |
-| `model_train.py` | LSTM training with partial-sequence augmentation |
-| `season_predict.py` | 2025-26 Kalshi predictions via softmax across teams |
-| `add_season.py` | Extend the dataset after a season finishes |
-| `constants.py` | API key for football-data.org (legacy) |
+- `constants.py` is gone. The legacy football-data.org API key (only used by the
+  optional `FootballDataAPI` wrapper) is now read from the `FOOTBALL_DATA_API_KEY`
+  environment variable — see `.env.example`. The main pipeline needs no key.

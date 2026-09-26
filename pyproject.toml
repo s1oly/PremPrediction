@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prem-prediction"
+version = "0.2.0"
+description = "LSTM-based week-by-week Premier League title probability model with a results-based Elo feature."
+requires-python = ">=3.10"
+dependencies = [
+    "tensorflow>=2.16",
+    "scikit-learn",
+    "pandas",
+    "numpy",
+    "requests",
+    "joblib",
+    "matplotlib",
+    "pillow",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
