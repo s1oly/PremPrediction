@@ -16,6 +16,8 @@ dependencies = [
     "joblib",
     "matplotlib",
     "pillow",
+    "beautifulsoup4",
+    "lxml",
 ]
 
 [tool.setuptools.packages.find]

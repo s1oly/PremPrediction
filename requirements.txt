@@ -6,3 +6,5 @@ requests
 joblib
 matplotlib
 pillow
+beautifulsoup4
+lxml
