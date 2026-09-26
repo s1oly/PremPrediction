@@ -1,7 +1,11 @@
 import pandas as pd
 
-from .elo import add_match_elo
+from .elo import add_match_elo, _final_positions_by_season
 from .paths import MATCHES_FILE, STANDINGS_FILE, TRAINING_FILE
+
+# Value used when a team was not in the PL the previous season (promoted / new).
+# One rung below last place, so "promoted" reads as weaker than "finished 20th".
+PROMOTED_PREV_POSITION = 21
 
 
 def numerical_form(form_string) -> float:
@@ -67,11 +71,36 @@ def add_relative_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_prev_position(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add `prev_position`: the team's final league position the previous season — a
+    clean pre-season prior for EVERY team, not just champions or Europe qualifiers.
+    Promoted / previously-absent teams get PROMOTED_PREV_POSITION.
+
+    It is constant within a season, so at gameweek 1 it is the model's main
+    differentiator (a side that finished 1st looks very different from one that
+    finished 17th before a ball is even kicked).
+    """
+    df = df.copy()
+    finals = _final_positions_by_season(df)  # {season: {team: final_pos}}
+    prev = {
+        (season + 1, team): pos
+        for season, table in finals.items()
+        for team, pos in table.items()
+    }
+    df["prev_position"] = [
+        prev.get((s, t), PROMOTED_PREV_POSITION)
+        for s, t in zip(df["season"], df["teamName"])
+    ]
+    return df
+
+
 def prepare(standings_df: pd.DataFrame, matches_df: pd.DataFrame) -> pd.DataFrame:
-    """Full preprocessing: form -> labels -> relative features -> chained match Elo."""
+    """Full preprocessing: form -> labels -> relative -> prev position -> match Elo."""
     df = convert_form(standings_df)
     df = add_labels(df)
     df = add_relative_features(df)
+    df = add_prev_position(df)
     df = add_match_elo(df, matches_df)
     return df
 

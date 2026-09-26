@@ -16,6 +16,7 @@ OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 MATCHES_FILE = DATA_DIR / "historical_matches.csv"
 STANDINGS_FILE = DATA_DIR / "historical_standings.csv"
 TRAINING_FILE = DATA_DIR / "out.csv"
+SQUAD_VALUE_FILE = DATA_DIR / "squad_values.csv"
 
 # Model artifacts
 MODEL_FILE = MODELS_DIR / "best_model.h5"

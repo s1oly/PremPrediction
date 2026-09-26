@@ -37,8 +37,10 @@ Europe is rewarded on its own, exactly as requested.
 
 import math
 
+import numpy as np
 import pandas as pd
 
+from .paths import SQUAD_VALUE_FILE
 from .trophy_data import trophy_bonus
 
 # --- Core match-Elo constants ---
@@ -53,6 +55,15 @@ SEASON_REGRESSION = 0.75   # fraction of last season's deviation from mean carri
 CL_QUALIFY_BONUS = 40.0    # ~top 5  -> Champions League
 EL_QUALIFY_BONUS = 25.0    # ~6th    -> Europa League
 ECL_QUALIFY_BONUS = 15.0   # ~7th    -> Conference League
+
+# --- Prestige seeding: squad market value ---
+# Elo points added per within-season z-score of log(squad market value). Using the
+# z-score of the log value makes this RELATIVE to the other squads that season, so
+# it is immune to transfer-fee inflation (a 2008 league and a 2026 league are scored
+# on the same relative scale). Only available from ~2005 (see squad_value.py); older
+# seasons get 0, so Elo stays defined for all history. Top squads land ~+150, the
+# cheapest ~-140, widening the gap between the elite and the rest before kickoff.
+VALUE_ELO_SCALE = 80.0
 
 
 def expected_score(rating_a: float, rating_b: float) -> float:
@@ -102,11 +113,35 @@ def _final_positions_by_season(standings_df: pd.DataFrame) -> dict[int, dict[str
     return result
 
 
+def load_value_bonuses(path=SQUAD_VALUE_FILE) -> dict[int, dict[str, float]]:
+    """
+    {season: {team: elo_bonus}} from squad_values.csv, where the bonus is
+    VALUE_ELO_SCALE × the within-season z-score of log(market value). Returns {} if
+    the file is absent, so the Elo pipeline still runs without squad data.
+    """
+    if not path.exists():
+        return {}
+    sv = pd.read_csv(path)
+    out: dict[int, dict[str, float]] = {}
+    for season, g in sv.groupby("season"):
+        log_val = np.log(g["value_eur"].to_numpy())
+        std = log_val.std()
+        if len(g) < 2 or std == 0:
+            out[int(season)] = {t: 0.0 for t in g["teamName"]}
+            continue
+        z = (log_val - log_val.mean()) / std
+        out[int(season)] = {
+            t: VALUE_ELO_SCALE * float(zi) for t, zi in zip(g["teamName"], z)
+        }
+    return out
+
+
 def season_start_rating(
     team: str,
     prev_season: int,
     carried: float | None,
     prev_positions: dict[str, int],
+    value_bonus: float = 0.0,
 ) -> float:
     """Rating a team begins a season on: mean-reverted carryover + prestige bonuses."""
     if carried is None:
@@ -115,6 +150,7 @@ def season_start_rating(
         base = MEAN_ELO + SEASON_REGRESSION * (carried - MEAN_ELO)
     base += european_qualification_bonus(prev_positions.get(team))
     base += trophy_bonus(team, prev_season)
+    base += value_bonus  # relative squad-value seed (0 before ~2005)
     return base
 
 
@@ -133,6 +169,7 @@ def compute_match_elo(
     matches = matches.sort_values(["season", "Date"]).reset_index(drop=True)
 
     final_positions = _final_positions_by_season(standings_df)
+    value_bonuses = load_value_bonuses()
 
     ratings: dict[str, float] = {}   # persistent across seasons
     records = []
@@ -140,12 +177,14 @@ def compute_match_elo(
     for season, sdf in matches.groupby("season"):
         season = int(season)
         prev_positions = final_positions.get(season - 1, {})
+        season_values = value_bonuses.get(season, {})
 
         # Season-start reseed for every team playing this season.
         teams = pd.unique(pd.concat([sdf["HomeTeam"], sdf["AwayTeam"]]).astype(str).str.strip())
         for team in teams:
             ratings[team] = season_start_rating(
-                team, season - 1, ratings.get(team), prev_positions
+                team, season - 1, ratings.get(team), prev_positions,
+                season_values.get(team, 0.0),
             )
 
         games_played: dict[str, int] = {}
