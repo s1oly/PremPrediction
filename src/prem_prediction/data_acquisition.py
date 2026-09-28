@@ -6,8 +6,14 @@ import requests
 
 from .config import API_KEY
 
-# Raw match columns kept from football-data.co.uk (results only — no odds/stats).
-MATCH_COLUMNS = ["season", "Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR"]
+# Mandatory result columns — present in every season back to 1993-94.
+RESULT_COLUMNS = ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR"]
+# Shot columns (shots, shots on target) — available from the 2000-01 season on.
+# Kept for the shot-based performance rating (match_stats.py); seasons that predate
+# them are filled with NaN and score as neutral (0), so history stays complete.
+STAT_COLUMNS = ["HS", "AS", "HST", "AST"]
+# Full set written to historical_matches.csv (Elo needs results, match_stats the shots).
+MATCH_COLUMNS = ["season"] + RESULT_COLUMNS + STAT_COLUMNS
 
 
 def season_to_fdcuk_code(start_year: int) -> str:
@@ -37,15 +43,20 @@ class FDCUKDataLoader:
             resp = requests.get(url, timeout=15, allow_redirects=True)
             resp.raise_for_status()
             df = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
-            needed = ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR"]
-            missing = [c for c in needed if c not in df.columns]
+            missing = [c for c in RESULT_COLUMNS if c not in df.columns]
             if missing:
                 print(f"  Season {start_year}: missing columns {missing}, skipping.")
                 return None
-            df = df[needed].dropna(subset=["HomeTeam", "AwayTeam", "FTR"])
+            # Keep results plus whatever shot columns this season carries.
+            keep = RESULT_COLUMNS + [c for c in STAT_COLUMNS if c in df.columns]
+            df = df[keep].dropna(subset=["HomeTeam", "AwayTeam", "FTR"])
             df = df[df["HomeTeam"].astype(str).str.strip() != ""].reset_index(drop=True)
+            # Backfill shot columns absent before 2000-01 so the schema is uniform.
+            for c in STAT_COLUMNS:
+                if c not in df.columns:
+                    df[c] = pd.NA
             df.insert(0, "season", start_year)
-            return df
+            return df[MATCH_COLUMNS]
         except Exception as e:
             print(f"  Failed to download season {start_year}: {e}")
             return None

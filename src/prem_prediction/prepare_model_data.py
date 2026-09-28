@@ -1,6 +1,7 @@
 import pandas as pd
 
 from .elo import add_match_elo, _final_positions_by_season
+from .match_stats import add_shot_perf
 from .paths import MATCHES_FILE, STANDINGS_FILE, TRAINING_FILE
 
 # Value used when a team was not in the PL the previous season (promoted / new).
@@ -96,12 +97,13 @@ def add_prev_position(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def prepare(standings_df: pd.DataFrame, matches_df: pd.DataFrame) -> pd.DataFrame:
-    """Full preprocessing: form -> labels -> relative -> prev position -> match Elo."""
+    """Full preprocessing: form -> labels -> relative -> prev position -> Elo -> shot perf."""
     df = convert_form(standings_df)
     df = add_labels(df)
     df = add_relative_features(df)
     df = add_prev_position(df)
     df = add_match_elo(df, matches_df)
+    df = add_shot_perf(df, matches_df)
     return df
 
 

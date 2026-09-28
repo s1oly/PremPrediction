@@ -15,6 +15,7 @@ FEATURES = [
     "points", "goalsFor", "goalsAgainst", "goalDifference",
     "games_remaining", "elo", "prev_position",
     "points_per_game", "points_gap_from_leader", "max_obtainable_points",
+    "shot_perf",  # rolling shot-based performance rating (match_stats.py)
 ]
 MAX_GAMEWEEK = 38
 

@@ -131,6 +131,63 @@ pierce.
 
 ---
 
+## Model vs Kalshi — a live market benchmark
+
+The model is a forecast; **[Kalshi](https://kalshi.com/)** is a real-money prediction
+market on the exact same question. Lining the two up is the most honest test of whether
+the model is *realistic*. Kalshi's public API is free — no key, no per-call cost — so
+[`kalshi.py`](src/prem_prediction/kalshi.py) pulls its Premier League "winner" market for
+the season in progress and compares it, gameweek by gameweek, to our own probabilities.
+
+![Model vs Kalshi](outputs/model_vs_kalshi.gif)
+
+> Solid = model, dashed = Kalshi. Rebuilt every gameweek by `update.py`.
+
+Two choices keep the comparison fair:
+- **Normalisation.** Each club is its own binary market, so the 20 YES prices don't sum
+  to 100% (≈97% early in 2026-27). Each day is renormalised to a proper distribution
+  before it's compared to the model's softmax.
+- **Alignment.** The model updates per gameweek; the market trades continuously. Each
+  gameweek is matched to the date the round finished, and Kalshi is sampled at its last
+  quote on or before that date — so both sides use only what they knew at the time.
+
+**Through GW5 the two broadly agree** on the shape of the race — a two-horse Arsenal/City
+lead, Liverpool a distant third, everyone else near zero:
+
+| Team | Model (GW5) | Kalshi (GW5) |
+|---|---:|---:|
+| Arsenal | 41.4% | 44.0% |
+| Man City | 44.0% | 36.7% |
+| Liverpool | 8.7% | 3.7% |
+| Chelsea | 0.5% | 4.6% |
+| Brighton | 2.0% | 2.8% |
+
+### The one big divergence is off the pitch — and the model can't see it
+
+The model rates **Manchester City** the joint-favourite; the market is markedly cooler on
+them, and the reason has nothing to do with football. In February 2023 the Premier League
+charged City with **115 alleged breaches** of its financial rules covering 2009–2018 (80
+financial breaches plus 35 counts of failing to cooperate). In September 2026 an
+independent commission **reportedly found the club in breach on 114 of the 115 charges**;
+no sanction has been set, and City are expected to appeal, but the market is pricing the
+risk of a **points deduction**.
+
+The timing makes the point cleanly. The verdict landed on **25 September — after GW5** — and
+Kalshi repriced City from **~38% to ~24%** in a single day, pushing Arsenal from **~48% to
+~61%**. The model didn't move and won't: legal risk is not one of its inputs (it sees only
+results, squad value and shot performance). It will mark City down *only* if their results
+start to slip.
+
+This is exactly the model's boundary. It's a strong read of on-pitch information, but a
+market will always fold in exogenous shocks — legal rulings, injuries, managerial changes —
+that a results-and-value model has no feature for. The Kalshi overlay is kept precisely so
+that gap is visible rather than hidden.
+
+*Sources: [beIN Sports, 25 Sep 2026](https://www.beinsports.com/en-us/soccer/premier-league/articles/manchester-city-receives-verdict-on-115-premier-league-charges-2026-09-25);
+[Yahoo Sports — the 115 charges explained](https://sports.yahoo.com/articles/man-city-115-charges-key-161032453.html).*
+
+---
+
 ## Project Layout
 
 ```
@@ -142,8 +199,9 @@ src/prem_prediction/     # the package
   prepare_model_data.py  #   form, labels, relative features, prev_position, Elo merge
   model_train.py         #   LSTM training
   season_predict.py      #   current-season Kalshi predictions → predictions.json
+  kalshi.py              #   pull + align the live Kalshi title market (free API)
   evaluate.py            #   grouped-season CV of the title ranking
-  viz.py                 #   title_race.gif + dashboard.html
+  viz.py                 #   title_race.gif + model_vs_kalshi.gif + dashboard.html
   build_dataset.py       #   full historical rebuild
   add_season.py          #   append a finished season
   update.py              #   gameweek refresh (predict + viz)
@@ -183,9 +241,15 @@ python -m prem_prediction.update
 ```
 
 `update` is the one you re-run each gameweek: it pulls the latest results, re-scores
-every completed gameweek, and rebuilds `outputs/title_race.gif` and
-`outputs/dashboard.html`. It does **not** retrain — that only happens once a season,
-after it completes.
+every completed gameweek, refreshes the Kalshi market comparison, and rebuilds
+`outputs/title_race.gif`, `outputs/model_vs_kalshi.gif`, and `outputs/dashboard.html`.
+It does **not** retrain — that only happens once a season, after it completes.
+
+The Kalshi comparison can also be refreshed on its own (free public API, no key):
+
+```bash
+python -m prem_prediction.kalshi     # writes data/kalshi_current.csv
+```
 
 ## Adding a Finished Season
 

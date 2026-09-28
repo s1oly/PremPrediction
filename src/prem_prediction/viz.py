@@ -13,9 +13,17 @@ Usage:
 import json
 
 import numpy as np
+import pandas as pd
 
 from .config import season_label
-from .paths import DASHBOARD_FILE, GIF_FILE, PREDICTIONS_FILE, ensure_dirs
+from .paths import (
+    COMPARISON_GIF_FILE,
+    DASHBOARD_FILE,
+    GIF_FILE,
+    KALSHI_FILE,
+    PREDICTIONS_FILE,
+    ensure_dirs,
+)
 
 # dataviz reference palette — categorical slots, light then dark.
 LIGHT_SLOTS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
@@ -154,6 +162,131 @@ def build_gif(pred: dict | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Model-vs-Kalshi comparison GIF (README)
+# ---------------------------------------------------------------------------
+
+def load_kalshi_series(gameweeks: list[int]) -> dict[str, list[float]]:
+    """
+    {team: [kalshi prob % per gameweek]} aligned to `gameweeks`, from kalshi_current.csv.
+    Missing (team, gameweek) cells become 0.0. Empty dict if the cache is absent.
+    """
+    if not KALSHI_FILE.exists():
+        return {}
+    k = pd.read_csv(KALSHI_FILE)
+    if k.empty:
+        return {}
+    wide = (
+        k.pivot_table(index="teamName", columns="gameweek", values="kalshi_prob", aggfunc="last")
+        .reindex(columns=gameweeks)
+    )
+    return {team: [float(v) * 100 if pd.notna(v) else 0.0 for v in row]
+            for team, row in wide.iterrows()}
+
+
+def build_comparison_gif(pred: dict | None = None, kalshi: dict | None = None) -> None:
+    """
+    Overlay the model's title probability (solid) against Kalshi's implied, normalised
+    probability (dashed) for the leading clubs, gameweek by gameweek. Skips silently if
+    there is no Kalshi cache yet (e.g. before the season's market opens).
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation, PillowWriter
+    from matplotlib.lines import Line2D
+
+    pred = pred or load_predictions()
+    gameweeks, teams_ranked, model = shape(pred)
+    kalshi = kalshi if kalshi is not None else load_kalshi_series(gameweeks)
+    if not kalshi:
+        print("No Kalshi cache — skipping model-vs-Kalshi GIF "
+              "(run `python -m prem_prediction.kalshi` first).")
+        return
+
+    # Lead teams by the larger of the two latest probabilities, so a club the market
+    # rates highly (e.g. the title favourite) is shown even if the model is cooler on it.
+    def latest(series, t):
+        return series.get(t, [0])[-1] if series.get(t) else 0.0
+    contenders = sorted(
+        set(teams_ranked) | set(kalshi),
+        key=lambda t: max(latest(model, t), latest(kalshi, t)),
+        reverse=True,
+    )
+    top = [t for t in contenders if t in model][:5]
+    cmap = color_map(teams_ranked, LIGHT_SLOTS)
+
+    gxs = np.array(gameweeks, dtype=float)
+    steps = 10 if len(gameweeks) <= 8 else 5
+    fine_x = (np.linspace(gxs[0], gxs[-1], (len(gameweeks) - 1) * steps + 1)
+              if len(gameweeks) > 1 else gxs)
+    m_y = {t: np.interp(fine_x, gxs, model[t]) for t in top}
+    k_y = {t: np.interp(fine_x, gxs, kalshi.get(t, [0] * len(gameweeks))) for t in top}
+
+    surface, page, ink, muted, grid = "#fcfcfb", "#f9f9f7", "#0b0b0b", "#898781", "#e1e0d9"
+    plt.rcParams.update({"font.family": "sans-serif", "font.size": 11})
+    fig, ax = plt.subplots(figsize=(9, 5), dpi=110)
+    fig.patch.set_facecolor(page)
+    ax.set_facecolor(surface)
+
+    y_max = max(max(max(m_y[t]), max(k_y[t])) for t in top) * 1.18 + 2
+    label = pred.get("season_label", "")
+
+    def draw(frame):
+        ax.clear()
+        ax.set_facecolor(surface)
+        n = frame + 1
+        x = fine_x[:n]
+        for t in top:
+            ax.plot(x, m_y[t][:n], color=cmap[t], linewidth=2.4, solid_capstyle="round")
+            ax.plot(x, k_y[t][:n], color=cmap[t], linewidth=2.0, linestyle=(0, (4, 3)), alpha=0.9)
+        if len(x):
+            xtip = x[-1]
+            tips = sorted(((m_y[t][n - 1], t) for t in top), reverse=True)
+            min_gap = y_max * 0.058
+            placed = []
+            for yv, t in tips:
+                ly = yv if not placed else min(yv, placed[-1] - min_gap)
+                placed.append(ly)
+                ax.plot(xtip, yv, "o", color=cmap[t], markersize=6,
+                        markeredgecolor=surface, markeredgewidth=1.5)
+                ax.text(xtip + 0.2, ly,
+                        f" {t}  M {yv:.0f} · K {k_y[t][n - 1]:.0f}",
+                        color=cmap[t], fontsize=9.5, va="center", fontweight="bold")
+
+        cur_gw = int(round(fine_x[min(frame, len(fine_x) - 1)]))
+        ax.set_xlim(gxs[0] - 0.2, gxs[-1] + max(6, gxs[-1] * 0.5))
+        ax.set_ylim(0, y_max)
+        ax.set_xticks(gameweeks)
+        ax.set_xlabel("Gameweek", color=muted, fontsize=10)
+        ax.set_ylabel("Title probability", color=muted, fontsize=10)
+        ax.set_title(f"Premier League {label} — Model vs Kalshi",
+                     color=ink, fontsize=15, fontweight="bold", loc="left", pad=14)
+        ax.text(0.0, 1.015, f"Through Gameweek {cur_gw}   ·   solid = model   ·   dashed = Kalshi",
+                transform=ax.transAxes, color=muted, fontsize=9.5)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0f}%"))
+        ax.grid(True, color=grid, linewidth=0.8)
+        ax.set_axisbelow(True)
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+        for s in ("left", "bottom"):
+            ax.spines[s].set_color("#c3c2b7")
+        ax.tick_params(colors=muted)
+        handles = [Line2D([0], [0], color=ink, lw=2.4, label="Model"),
+                   Line2D([0], [0], color=ink, lw=2.0, linestyle=(0, (4, 3)), label="Kalshi")]
+        ax.legend(handles=handles, loc="upper right", frameon=False, fontsize=9,
+                  labelcolor=muted)
+        fig.tight_layout()
+
+    total = len(fine_x)
+    frames = list(range(total)) + [total - 1] * 10
+    anim = FuncAnimation(fig, draw, frames=frames, interval=110)
+    ensure_dirs()
+    anim.save(COMPARISON_GIF_FILE, writer=PillowWriter(fps=9, metadata={"loop": 0}))
+    plt.close(fig)
+    print(f"Comparison GIF written to {COMPARISON_GIF_FILE}")
+
+
+# ---------------------------------------------------------------------------
 # Interactive dashboard (self-contained HTML)
 # ---------------------------------------------------------------------------
 
@@ -184,6 +317,7 @@ def build_dashboard(pred: dict | None = None) -> None:
 def build_all() -> None:
     pred = load_predictions()
     build_gif(pred)
+    build_comparison_gif(pred)
     build_dashboard(pred)
 
 

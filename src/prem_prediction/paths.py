@@ -25,7 +25,11 @@ SCALER_FILE = MODELS_DIR / "scaler.joblib"
 # Outputs (predictions + visualisations)
 PREDICTIONS_FILE = OUTPUTS_DIR / "predictions.json"
 GIF_FILE = OUTPUTS_DIR / "title_race.gif"
+COMPARISON_GIF_FILE = OUTPUTS_DIR / "model_vs_kalshi.gif"
 DASHBOARD_FILE = OUTPUTS_DIR / "dashboard.html"
+
+# Kalshi market comparison cache (data/)
+KALSHI_FILE = DATA_DIR / "kalshi_current.csv"
 
 
 def ensure_dirs() -> None:
