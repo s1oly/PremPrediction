@@ -1,7 +1,7 @@
 {
   "season": 2026,
   "season_label": "2026-27",
-  "updated_utc": "2026-10-27T13:43:42+00:00",
+  "updated_utc": "2026-11-03T13:24:00+00:00",
   "gameweeks": {
     "1": {
       "Brighton": 0.092142,
@@ -178,6 +178,28 @@
       "Coventry": 3.5e-05,
       "Tottenham": 4.3e-05,
       "Aston Villa": 6.7e-05
+    },
+    "9": {
+      "Brighton": 0.100191,
+      "Arsenal": 0.284364,
+      "Brentford": 0.006781,
+      "Hull": 7.3e-05,
+      "Everton": 0.000172,
+      "Chelsea": 0.000879,
+      "Ipswich": 4.6e-05,
+      "Man City": 0.507719,
+      "Leeds": 6.9e-05,
+      "Newcastle": 5.5e-05,
+      "Liverpool": 0.09894,
+      "Fulham": 5.5e-05,
+      "Sunderland": 4.7e-05,
+      "Bournemouth": 7.7e-05,
+      "Nott'm Forest": 4.7e-05,
+      "Man United": 0.000248,
+      "Crystal Palace": 4.6e-05,
+      "Coventry": 4.5e-05,
+      "Tottenham": 6.1e-05,
+      "Aston Villa": 8.6e-05
     }
   }
 }
