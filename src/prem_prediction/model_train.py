@@ -16,6 +16,7 @@ FEATURES = [
     "games_remaining", "elo", "prev_position",
     "points_per_game", "points_gap_from_leader", "max_obtainable_points",
     "shot_perf",  # rolling shot-based performance rating (match_stats.py)
+    "sos_played", "sos_remaining",  # strength of schedule faced / still to come (schedule_strength.py)
 ]
 MAX_GAMEWEEK = 38
 

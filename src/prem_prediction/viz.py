@@ -296,12 +296,15 @@ def build_dashboard(pred: dict | None = None) -> None:
     light = color_map(teams_ranked, LIGHT_SLOTS)
     dark = color_map(teams_ranked, DARK_SLOTS)
 
+    kalshi = load_kalshi_series(gameweeks)  # {team: [kalshi % per gw]}; {} if no cache
+
     data = {
         "seasonLabel": pred.get("season_label", ""),
         "updated": pred.get("updated_utc", ""),
         "gameweeks": gameweeks,
         "teamsRanked": teams_ranked,
         "series": {t: series[t] for t in teams_ranked},
+        "kalshi": kalshi,  # empty object before the market opens
         "colorLight": light,
         "colorDark": dark,
         "nColored": N_COLORED,
@@ -427,8 +430,12 @@ const colors = () => isDark() ? DATA.colorDark : DATA.colorLight;
 const cssvar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 
 const GW = DATA.gameweeks, TEAMS = DATA.teamsRanked, S = DATA.series;
+const K = DATA.kalshi || {};
+const hasKalshi = Object.keys(K).length > 0;
+const kal = (t) => (K[t] && K[t][lastIdx] != null) ? K[t][lastIdx] : null;  // latest Kalshi % or null
 const lastIdx = GW.length - 1;
 const pct = (v) => (v).toFixed(1) + "%";
+const signed = (v) => (v >= 0 ? "+" : "") + v.toFixed(1);
 let showAll = false;
 
 function visibleTeams() {
@@ -452,12 +459,17 @@ function renderTiles() {
     const d = cur - prev;
     const arrow = d > 0.05 ? "▲" : d < -0.05 ? "▼" : "→";
     const dcol = d > 0.05 ? "var(--good)" : "var(--sec)";
+    const k = kal(t);
+    const kalLine = hasKalshi
+      ? `<div class="delta">Kalshi ${k != null ? pct(k) : "&mdash;"}${k != null ? "  &middot;  edge " + signed(cur - k) : ""}</div>`
+      : "";
     const el = document.createElement("div");
     el.className = "tile";
     el.innerHTML =
       `<div class="name"><span class="swatch" style="background:${c[t]}"></span>${t}</div>
        <div class="val">${pct(cur)}</div>
-       <div class="delta" style="color:${dcol}">${arrow} ${Math.abs(d).toFixed(1)} pts since GW${GW[lastIdx-1] ?? GW[lastIdx]}</div>`;
+       <div class="delta" style="color:${dcol}">${arrow} ${Math.abs(d).toFixed(1)} pts since GW${GW[lastIdx-1] ?? GW[lastIdx]}</div>
+       ${kalLine}`;
     box.appendChild(el);
   });
 }
@@ -573,11 +585,22 @@ svg.addEventListener("pointerleave", () => {
 function renderTable() {
   const c = colors();
   const peak = t => Math.max(...S[t]);
-  let h = `<table><thead><tr><th>Team</th><th>Now</th><th>Δ GW</th><th>Peak</th></tr></thead><tbody>`;
+  const kalHead = hasKalshi ? `<th>Model</th><th>Kalshi</th><th>Edge</th>` : `<th>Now</th>`;
+  let h = `<table><thead><tr><th>Team</th>${kalHead}<th>Δ GW</th><th>Peak</th></tr></thead><tbody>`;
   TEAMS.forEach(t => {
     const cur = S[t][lastIdx], prev = lastIdx > 0 ? S[t][lastIdx - 1] : cur, d = cur - prev;
+    let cols;
+    if (hasKalshi) {
+      const k = kal(t);
+      const edge = k != null ? signed(cur - k) : "&mdash;";
+      const ecol = k != null ? (cur - k > 0 ? "var(--good)" : "var(--sec)") : "var(--muted)";
+      cols = `<td>${pct(cur)}</td><td>${k != null ? pct(k) : "&mdash;"}</td>`
+           + `<td style="color:${ecol}">${edge}</td>`;
+    } else {
+      cols = `<td>${pct(cur)}</td>`;
+    }
     h += `<tr><td><span class="swatch" style="display:inline-block;background:${c[t]};margin-right:7px"></span>${t}</td>
-      <td>${pct(cur)}</td><td>${d >= 0 ? "+" : ""}${d.toFixed(1)}</td><td>${pct(peak(t))}</td></tr>`;
+      ${cols}<td>${d >= 0 ? "+" : ""}${d.toFixed(1)}</td><td>${pct(peak(t))}</td></tr>`;
   });
   document.getElementById("tableWrap").innerHTML = h + "</tbody></table>";
 }
@@ -597,7 +620,12 @@ btnT.onclick = () => setView(true);
 document.getElementById("foot").innerHTML =
   "Probabilities from an LSTM trained on every Premier League season since 1993-94, " +
   "with a results-based Elo strength feature; the 20 teams' logits are passed through a " +
-  "softmax each gameweek, so they always sum to 100%. Data: football-data.co.uk.";
+  "softmax each gameweek, so they always sum to 100%. Data: football-data.co.uk." +
+  (hasKalshi
+    ? " <b>Kalshi</b> is the live prediction market's implied probability (each day's "
+      + "20 club prices renormalised to sum to 100%); <b>Edge</b> is model &minus; Kalshi, "
+      + "so a positive edge means the model is higher on that club than the market."
+    : "");
 
 function renderAll() { renderTiles(); renderChart(); renderLegend(); renderTable(); }
 renderAll();
