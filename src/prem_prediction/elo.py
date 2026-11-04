@@ -46,9 +46,11 @@ from .trophy_data import trophy_bonus
 # --- Core match-Elo constants ---
 MEAN_ELO = 1500.0          # league-average anchor
 NEW_TEAM_ELO = 1425.0      # promoted / never-before-seen teams enter below average
-HOME_ADVANTAGE = 65.0      # Elo points added to the home side's expectation
-K_FACTOR = 20.0            # base update size per match
-SEASON_REGRESSION = 0.75   # fraction of last season's deviation from mean carried over
+# K / HFA / REG are fitted, not hand-set: fit_elo_params() grid-searches them for the
+# lowest one-step match-prediction Brier over all PL history (see fit_elo_params).
+HOME_ADVANTAGE = 65.0      # Elo points added to the home side's expectation (fitted)
+K_FACTOR = 12.0            # base update size per match (fitted)
+SEASON_REGRESSION = 0.85   # fraction of last season's deviation from mean carried over (fitted)
 
 # --- Prestige seeding: European qualification bonus by previous-season finish ---
 # Rewards finishing high enough to reach Europe, even with zero trophies.
@@ -136,56 +138,50 @@ def load_value_bonuses(path=SQUAD_VALUE_FILE) -> dict[int, dict[str, float]]:
     return out
 
 
-def season_start_rating(
-    team: str,
-    prev_season: int,
-    carried: float | None,
-    prev_positions: dict[str, int],
-    value_bonus: float = 0.0,
-) -> float:
-    """Rating a team begins a season on: mean-reverted carryover + prestige bonuses."""
+def season_start_rating(carried: float | None) -> float:
+    """
+    Rating a team begins a season on: a pure mean-reverted carryover of last
+    season's end rating, with NO prestige seeding.
+
+    Prestige context (previous finish, trophies won, squad market value) used to
+    be folded into this seed as hand-tuned additive Elo bonuses. That made the
+    *weight* of those priors a human choice. They now enter the model as their own
+    features (prev_position, trophy_score, squad_value_z — see prepare_model_data),
+    so the LSTM learns how much each is worth. Elo is therefore a clean results-only
+    rating again, and `prev_positions` / squad value no longer touch it.
+    """
     if carried is None:
-        base = NEW_TEAM_ELO
-    else:
-        base = MEAN_ELO + SEASON_REGRESSION * (carried - MEAN_ELO)
-    base += european_qualification_bonus(prev_positions.get(team))
-    base += trophy_bonus(team, prev_season)
-    base += value_bonus  # relative squad-value seed (0 before ~2005)
-    return base
+        return NEW_TEAM_ELO
+    return MEAN_ELO + SEASON_REGRESSION * (carried - MEAN_ELO)
 
 
 def compute_match_elo(
     matches_df: pd.DataFrame,
-    standings_df: pd.DataFrame,
+    standings_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Run the chained Elo over every match in `matches_df` (all seasons) and return
     a long frame of (season, teamName, gameweek, elo), where `elo` is the team's
     rating *after* its Nth match of the season — aligning with the standings
     convention that a row is a team's state after N games.
+
+    `standings_df` is accepted for a stable call signature but is no longer used:
+    Elo is now pure results, so final positions do not seed it.
     """
     matches = matches_df.copy()
     matches["Date"] = pd.to_datetime(matches["Date"], format="mixed", dayfirst=True, errors="coerce")
     matches = matches.sort_values(["season", "Date"]).reset_index(drop=True)
-
-    final_positions = _final_positions_by_season(standings_df)
-    value_bonuses = load_value_bonuses()
 
     ratings: dict[str, float] = {}   # persistent across seasons
     records = []
 
     for season, sdf in matches.groupby("season"):
         season = int(season)
-        prev_positions = final_positions.get(season - 1, {})
-        season_values = value_bonuses.get(season, {})
 
-        # Season-start reseed for every team playing this season.
+        # Season-start reseed for every team playing this season (pure carryover).
         teams = pd.unique(pd.concat([sdf["HomeTeam"], sdf["AwayTeam"]]).astype(str).str.strip())
         for team in teams:
-            ratings[team] = season_start_rating(
-                team, season - 1, ratings.get(team), prev_positions,
-                season_values.get(team, 0.0),
-            )
+            ratings[team] = season_start_rating(ratings.get(team))
 
         games_played: dict[str, int] = {}
         for _, m in sdf.iterrows():
@@ -218,6 +214,59 @@ def compute_match_elo(
                 })
 
     return pd.DataFrame(records)
+
+
+def _replay_brier(matches: pd.DataFrame, k: float, hfa: float, reg: float,
+                  warmup_seasons: int = 1) -> float:
+    """
+    Replay every match with pure-results Elo under (k, hfa, reg) and return the mean
+    Brier score of the one-step-ahead expected home score vs the actual result
+    (win=1, draw=0.5, loss=0). Lower is better. The first `warmup_seasons` seasons
+    are scored-through but excluded from the average so ratings can settle.
+    """
+    ratings: dict[str, float] = {}
+    seasons = sorted(matches["season"].unique())
+    eval_from = seasons[min(warmup_seasons, len(seasons) - 1)]
+    sq_err, n = 0.0, 0
+    for season, sdf in matches.groupby("season"):
+        teams = pd.unique(pd.concat([sdf["HomeTeam"], sdf["AwayTeam"]]).astype(str).str.strip())
+        for t in teams:
+            c = ratings.get(t)
+            ratings[t] = NEW_TEAM_ELO if c is None else MEAN_ELO + reg * (c - MEAN_ELO)
+        for _, m in sdf.iterrows():
+            home, away = str(m["HomeTeam"]).strip(), str(m["AwayTeam"]).strip()
+            hg, ag = int(m["FTHG"]), int(m["FTAG"])
+            exp_home = expected_score(ratings[home] + hfa, ratings[away])
+            s_home = 1.0 if hg > ag else (0.0 if hg < ag else 0.5)
+            if season >= eval_from:
+                sq_err += (exp_home - s_home) ** 2
+                n += 1
+            delta = k * goal_diff_multiplier(hg - ag) * (s_home - exp_home)
+            ratings[home] += delta
+            ratings[away] -= delta
+    return sq_err / max(n, 1)
+
+
+def fit_elo_params(matches_df: pd.DataFrame,
+                   k_grid=(12, 16, 20, 24, 28, 32, 40),
+                   hfa_grid=(40, 55, 65, 80, 100),
+                   reg_grid=(0.6, 0.7, 0.75, 0.85, 0.95)) -> dict:
+    """
+    Grid-search (K, HOME_ADVANTAGE, SEASON_REGRESSION) for the lowest match-prediction
+    Brier over all history, so the Elo constants are fitted rather than hand-set.
+    Returns {"K", "HFA", "REG", "brier"}.
+    """
+    matches = matches_df.copy()
+    matches["Date"] = pd.to_datetime(matches["Date"], format="mixed", dayfirst=True, errors="coerce")
+    matches = matches.sort_values(["season", "Date"]).reset_index(drop=True)
+    best = {"brier": float("inf")}
+    for k in k_grid:
+        for hfa in hfa_grid:
+            for reg in reg_grid:
+                b = _replay_brier(matches, k, hfa, reg)
+                if b < best["brier"]:
+                    best = {"K": k, "HFA": hfa, "REG": reg, "brier": round(b, 5)}
+    return best
 
 
 def add_match_elo(standings_df: pd.DataFrame, matches_df: pd.DataFrame) -> pd.DataFrame:

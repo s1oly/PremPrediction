@@ -24,11 +24,14 @@ from .paths import (
     MATCHES_FILE,
     MODEL_FILE,
     PREDICTIONS_FILE,
+    RESIDUAL_STD_FILE,
     SCALER_FILE,
     STANDINGS_FILE,
     ensure_dirs,
 )
 from .prepare_model_data import prepare
+
+N_SIMS = 20000  # Monte Carlo draws per gameweek for the title-probability estimate
 
 PREDICT_SEASON = current_season_start_year()  # e.g. 2026 for the 2026-27 season
 
@@ -43,28 +46,45 @@ def pad_sequence(X: np.ndarray, max_len: int = MAX_GAMEWEEK) -> np.ndarray:
     return np.vstack([X, np.zeros((pad_len, X.shape[1]))])
 
 
-def get_team_logit(model, scaler, team_df: pd.DataFrame) -> float:
-    """Return the raw logit for a single team's partial-season sequence."""
+def get_team_points(model, scaler, team_df: pd.DataFrame) -> float:
+    """Predicted final-season points for a single team's partial-season sequence."""
     team_df = team_df.sort_values("gameweek")
     X = scaler.transform(team_df[FEATURES])
     X_padded = pad_sequence(X, MAX_GAMEWEEK)
     return float(model.predict(np.expand_dims(X_padded, axis=0), verbose=0)[0][0])
 
 
-def predict_gameweek(model, scaler, season_df, gameweek, temperature=1.0) -> dict[str, float]:
+def predict_gameweek(model, scaler, season_df, gameweek, resid_std, n_sims=N_SIMS) -> dict[str, float]:
     """
-    Collect raw logits for all teams up to `gameweek`, then softmax across all
-    teams to produce a proper probability distribution (sums to 1.0).
+    Predict every team's final points as of `gameweek`, then derive the title
+    probability as P(a team's final points are the league's highest) by Monte Carlo:
+    sample each team's final total from N(predicted, std[gameweek]), clipped to the
+    realistic band [points already earned, maximum still obtainable], and count how
+    often each team tops the simulated table. std[gameweek] is the model's own
+    final-points error at that stage (wide early, tight late), so the probabilities
+    sharpen as the season progresses.
     """
     gw_df = season_df[season_df["gameweek"] <= gameweek]
     teams = list(gw_df["teamName"].unique())
 
-    logits = np.array([
-        get_team_logit(model, scaler, gw_df[gw_df["teamName"] == t]) for t in teams
-    ])
-    logits_scaled = logits / temperature
-    exp_logits = np.exp(logits_scaled - logits_scaled.max())  # numerically stable
-    probs = exp_logits / exp_logits.sum()
+    std = float(resid_std.get(str(gameweek), resid_std.get("overall", 8.0)))
+    std = max(std, 1e-6)
+
+    preds, floors, ceils = [], [], []
+    for t in teams:
+        tdf = gw_df[gw_df["teamName"] == t]
+        latest = tdf.sort_values("gameweek").iloc[-1]
+        preds.append(get_team_points(model, scaler, tdf))
+        floors.append(float(latest["points"]))                 # can't finish below current points
+        ceils.append(float(latest["max_obtainable_points"]))   # or above the max still obtainable
+
+    preds = np.array(preds); floors = np.array(floors); ceils = np.array(ceils)
+    # Sample final points for every team and tally who tops the table each sim.
+    samples = np.random.normal(preds[:, None], std, size=(len(teams), n_sims))
+    samples = np.clip(samples, floors[:, None], ceils[:, None])
+    winners = np.argmax(samples, axis=0)  # index of the top team in each simulation
+    counts = np.bincount(winners, minlength=len(teams))
+    probs = counts / float(n_sims)
     return dict(zip(teams, probs))
 
 
@@ -91,14 +111,14 @@ def build_current_season_frame() -> pd.DataFrame:
     return processed[processed["season"] == PREDICT_SEASON].copy()
 
 
-def predict_all_gameweeks(model, scaler, season_df) -> dict[int, dict[str, float]]:
-    """Return {gameweek: {team: probability}} for every completed gameweek."""
+def predict_all_gameweeks(model, scaler, season_df, resid_std) -> dict[int, dict[str, float]]:
+    """Return {gameweek: {team: title probability}} for every completed gameweek."""
     max_gw = int(season_df["gameweek"].max())
     predictions = {}
     for gw in range(1, max_gw + 1):
         if season_df[season_df["gameweek"] == gw].empty:
             continue
-        predictions[gw] = predict_gameweek(model, scaler, season_df, gw)
+        predictions[gw] = predict_gameweek(model, scaler, season_df, gw, resid_std)
     return predictions
 
 
@@ -119,15 +139,24 @@ def save_predictions(predictions: dict[int, dict[str, float]], season: int) -> N
     print(f"\nPredictions written to {PREDICTIONS_FILE}")
 
 
+def load_residual_std() -> dict:
+    """Load the per-gameweek final-points error std; empty dict falls back to a default."""
+    if RESIDUAL_STD_FILE.exists():
+        with open(RESIDUAL_STD_FILE) as f:
+            return json.load(f)
+    return {}
+
+
 def main():
     model = load_model(MODEL_FILE, compile=False)
     scaler = joblib.load(SCALER_FILE)
+    resid_std = load_residual_std()
 
     season_df = build_current_season_frame()
     max_gw = int(season_df["gameweek"].max())
     print(f"\nPredicting gameweeks 1-{max_gw} for {season_label(PREDICT_SEASON)}.\n")
 
-    predictions = predict_all_gameweeks(model, scaler, season_df)
+    predictions = predict_all_gameweeks(model, scaler, season_df, resid_std)
     save_predictions(predictions, PREDICT_SEASON)
 
     latest = predictions[max_gw]

@@ -618,9 +618,10 @@ btnC.onclick = () => setView(false);
 btnT.onclick = () => setView(true);
 
 document.getElementById("foot").innerHTML =
-  "Probabilities from an LSTM trained on every Premier League season since 1993-94, " +
-  "with a results-based Elo strength feature; the 20 teams' logits are passed through a " +
-  "softmax each gameweek, so they always sum to 100%. Data: football-data.co.uk." +
+  "An LSTM trained on every Premier League season since 1993-94 predicts each club's " +
+  "final points from its season so far; title odds are the share of 20,000 simulated " +
+  "season-endings in which that club finishes top, so they sum to 100%. " +
+  "Data: football-data.co.uk." +
   (hasKalshi
     ? " <b>Kalshi</b> is the live prediction market's implied probability (each day's "
       + "20 club prices renormalised to sum to 100%); <b>Edge</b> is model &minus; Kalshi, "

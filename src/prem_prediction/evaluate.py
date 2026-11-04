@@ -31,7 +31,9 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from tensorflow.keras.callbacks import EarlyStopping
 
-from .model_train import FEATURES, MAX_GAMEWEEK, build_model, build_sequences
+from .model_train import (
+    FEATURES, MAX_GAMEWEEK, build_model, build_sequences, calibrate_residual_std,
+)
 from .paths import OUTPUTS_DIR, TRAINING_FILE, ensure_dirs
 
 EVAL_GAMEWEEKS = [1, 5, 10, 15, 19, 25, 30, 35, 38]
@@ -43,18 +45,29 @@ def _pad(X: np.ndarray) -> np.ndarray:
     return np.vstack([X, np.zeros((MAX_GAMEWEEK - X.shape[0], X.shape[1]))])
 
 
-def softmax_title_probs(model, scaler, season_df: pd.DataFrame, gameweek: int) -> dict[str, float]:
-    """Softmax title probabilities across all teams at `gameweek` (one batched predict)."""
+def simulate_title_probs(model, scaler, season_df: pd.DataFrame, gameweek: int,
+                         std: float, n_sims: int = 10000) -> dict[str, float]:
+    """
+    Title probabilities at `gameweek` from the final-points regressor: predict each
+    team's final points, sample N(pred, std) clipped to [earned, max obtainable], and
+    count how often each team tops the simulated table (one batched predict).
+    """
     gw_df = season_df[season_df["gameweek"] <= gameweek]
     teams = list(gw_df["teamName"].unique())
-    seqs = []
+    seqs, floors, ceils = [], [], []
     for t in teams:
         tdf = gw_df[gw_df["teamName"] == t].sort_values("gameweek")
         seqs.append(_pad(scaler.transform(tdf[FEATURES])))
-    logits = model.predict(np.stack(seqs), verbose=0).ravel()
-    exp = np.exp(logits - logits.max())
-    probs = exp / exp.sum()
-    return dict(zip(teams, probs))
+        latest = tdf.iloc[-1]
+        floors.append(float(latest["points"]))
+        ceils.append(float(latest["max_obtainable_points"]))
+    preds = model.predict(np.stack(seqs), verbose=0).ravel()
+    floors, ceils = np.array(floors), np.array(ceils)
+    s = max(float(std), 1e-6)
+    samples = np.clip(np.random.normal(preds[:, None], s, (len(teams), n_sims)),
+                      floors[:, None], ceils[:, None])
+    counts = np.bincount(np.argmax(samples, axis=0), minlength=len(teams))
+    return dict(zip(teams, counts / float(n_sims)))
 
 
 def _season_folds(seasons: list[int], k: int, seed: int) -> list[list[int]]:
@@ -72,28 +85,30 @@ def run_cv(k: int = 5, eval_gws=EVAL_GAMEWEEKS, epochs: int = 40, seed: int = 42
     ]
     folds = _season_folds(seasons, k, seed)
     print(f"Evaluating {len(seasons)} seasons in {k} grouped folds "
-          f"({FEATURES.count('elo')} elo feature incl. squad value)...")
+          f"({len(FEATURES)} features, final-points regressor)...")
 
     records = []
     for fi, test_seasons in enumerate(folds, 1):
         train_df = df[~df["season"].isin(test_seasons)].copy()
         scaler = StandardScaler()
         train_df[FEATURES] = scaler.fit_transform(train_df[FEATURES])
-        X, y = build_sequences(train_df, FEATURES)
+        X, y, cutoffs = build_sequences(train_df, FEATURES)
         model = build_model(X.shape[1], X.shape[2])
         model.fit(
             X, y, validation_split=0.15, epochs=epochs, batch_size=32, verbose=0,
             callbacks=[EarlyStopping(patience=6, restore_best_weights=True, monitor="val_loss")],
         )
+        resid_std = calibrate_residual_std(model, X, y, cutoffs)
 
         for s in test_seasons:
-            sdf = df[df["season"] == s]  # unscaled — softmax_title_probs scales internally
+            sdf = df[df["season"] == s]  # unscaled — simulate_title_probs scales internally
             champ = sdf[sdf["won_league"] == 1]["teamName"].iloc[0]
             for gw in eval_gws:
                 gw_rows = sdf[sdf["gameweek"] == gw]
                 if gw_rows.empty:
                     continue
-                probs = softmax_title_probs(model, scaler, sdf, gw)
+                std = float(resid_std.get(str(gw), resid_std.get("overall", 8.0)))
+                probs = simulate_title_probs(model, scaler, sdf, gw, std)
                 p_ch = probs.get(champ, 1e-12)
                 ranked = sorted(probs, key=probs.get, reverse=True)
                 leader = gw_rows.sort_values("position")["teamName"].iloc[0]

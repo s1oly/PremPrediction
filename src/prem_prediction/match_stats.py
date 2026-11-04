@@ -48,17 +48,27 @@ def _num(v) -> float:
     return 0.0 if pd.isna(f) else f
 
 
-def _match_perf(sot_diff: float, shot_diff: float) -> float:
-    """A single match's performance score for one team (already signed)."""
-    return SOT_WEIGHT * sot_diff + SHOT_WEIGHT * shot_diff
+def _shot_quality(sot: float, shots: float) -> float:
+    """A single match's chance-quality score for one side (shots on target weighted up)."""
+    return SOT_WEIGHT * sot + SHOT_WEIGHT * shots
 
 
-def compute_shot_perf(matches_df: pd.DataFrame) -> pd.DataFrame:
+def compute_shot_features(matches_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Roll a shot-based performance rating over every match and return a long frame
-    of (season, teamName, gameweek, shot_perf), where the value at gameweek N is the
-    mean per-match performance across the team's last ROLL_WINDOW games *including*
-    its Nth — matching the standings/Elo convention that a row is state after N games.
+    Roll two shot-based ratings over every match and return a long frame of
+    (season, teamName, gameweek, shot_att, shot_def):
+
+      shot_att — chance quality a team CREATES  (its own SOT/shots), rolled over
+                 the last ROLL_WINDOW games: a measure of attacking output.
+      shot_def — chance quality a team CONCEDES (opponents' SOT/shots), same window:
+                 a measure of defensive solidity (lower = a meaner defence).
+
+    Previously these were fused into one net differential (`shot_perf`), which the
+    model could not weight separately — so a mean defence and a potent attack looked
+    identical. Splitting them lets the LSTM learn each side's predictive value on its
+    own (chances conceded often predicts titles more than chances created). The value
+    at gameweek N spans the team's last ROLL_WINDOW games including its Nth, matching
+    the standings/Elo "state after N games" convention.
     """
     matches = matches_df.copy()
     matches["Date"] = pd.to_datetime(
@@ -69,7 +79,8 @@ def compute_shot_perf(matches_df: pd.DataFrame) -> pd.DataFrame:
     records = []
     for season, sdf in matches.groupby("season"):
         season = int(season)
-        history: dict[str, list[float]] = {}
+        att_hist: dict[str, list[float]] = {}
+        def_hist: dict[str, list[float]] = {}
         games_played: dict[str, int] = {}
 
         for _, m in sdf.iterrows():
@@ -78,29 +89,37 @@ def compute_shot_perf(matches_df: pd.DataFrame) -> pd.DataFrame:
 
             hst, ast = _num(m.get("HST")), _num(m.get("AST"))
             hs, as_ = _num(m.get("HS")), _num(m.get("AS"))
-            home_perf = _match_perf(hst - ast, hs - as_)  # away is the negative
+            home_created = _shot_quality(hst, hs)   # = away conceded
+            away_created = _shot_quality(ast, as_)  # = home conceded
 
-            for team, perf in ((home, home_perf), (away, -home_perf)):
-                history.setdefault(team, []).append(perf)
+            for team, created, conceded in (
+                (home, home_created, away_created),
+                (away, away_created, home_created),
+            ):
+                att_hist.setdefault(team, []).append(created)
+                def_hist.setdefault(team, []).append(conceded)
                 games_played[team] = games_played.get(team, 0) + 1
-                window = history[team][-ROLL_WINDOW:]
+                aw = att_hist[team][-ROLL_WINDOW:]
+                dw = def_hist[team][-ROLL_WINDOW:]
                 records.append({
                     "season": season,
                     "teamName": team,
                     "gameweek": games_played[team],
-                    "shot_perf": sum(window) / len(window),
+                    "shot_att": sum(aw) / len(aw),
+                    "shot_def": sum(dw) / len(dw),
                 })
 
     return pd.DataFrame(records)
 
 
-def add_shot_perf(standings_df: pd.DataFrame, matches_df: pd.DataFrame) -> pd.DataFrame:
+def add_shot_features(standings_df: pd.DataFrame, matches_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Merge a `shot_perf` column onto a standings frame, keyed by
+    Merge `shot_att` and `shot_def` columns onto a standings frame, keyed by
     (season, teamName, gameweek). Rows with no shot data fall back to 0 (neutral),
     so pre-2000 seasons and the odd missing fixture stay defined.
     """
-    perf_df = compute_shot_perf(matches_df)
-    merged = standings_df.merge(perf_df, on=["season", "teamName", "gameweek"], how="left")
-    merged["shot_perf"] = merged["shot_perf"].fillna(0.0)
+    feat_df = compute_shot_features(matches_df)
+    merged = standings_df.merge(feat_df, on=["season", "teamName", "gameweek"], how="left")
+    merged["shot_att"] = merged["shot_att"].fillna(0.0)
+    merged["shot_def"] = merged["shot_def"].fillna(0.0)
     return merged

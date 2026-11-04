@@ -21,6 +21,9 @@ SQUAD_VALUE_FILE = DATA_DIR / "squad_values.csv"
 # Model artifacts
 MODEL_FILE = MODELS_DIR / "best_model.h5"
 SCALER_FILE = MODELS_DIR / "scaler.joblib"
+# Per-gameweek std of the final-points prediction error, used to turn point
+# predictions into title probabilities by simulation (see season_predict).
+RESIDUAL_STD_FILE = MODELS_DIR / "point_residual_std.json"
 
 # Outputs (predictions + visualisations)
 PREDICTIONS_FILE = OUTPUTS_DIR / "predictions.json"
