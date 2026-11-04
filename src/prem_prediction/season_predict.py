@@ -19,7 +19,7 @@ from tensorflow.keras.models import load_model
 
 from .config import current_season_start_year, season_label
 from .data_acquisition import FDCUKDataLoader
-from .model_train import FEATURES, MAX_GAMEWEEK
+from .model_train import FEATURES, MAX_GAMEWEEK, blend_final_points
 from .paths import (
     MATCHES_FILE,
     MODEL_FILE,
@@ -70,15 +70,18 @@ def predict_gameweek(model, scaler, season_df, gameweek, resid_std, n_sims=N_SIM
     std = float(resid_std.get(str(gameweek), resid_std.get("overall", 8.0)))
     std = max(std, 1e-6)
 
-    preds, floors, ceils = [], [], []
+    preds, floors, ceils, gws = [], [], [], []
     for t in teams:
         tdf = gw_df[gw_df["teamName"] == t]
         latest = tdf.sort_values("gameweek").iloc[-1]
         preds.append(get_team_points(model, scaler, tdf))
         floors.append(float(latest["points"]))                 # can't finish below current points
         ceils.append(float(latest["max_obtainable_points"]))   # or above the max still obtainable
+        gws.append(int(latest["gameweek"]))                     # games played so far (for the pace anchor)
 
     preds = np.array(preds); floors = np.array(floors); ceils = np.array(ceils)
+    # Anchor the LSTM forecast to current pace (fixes mid-season overshoot — see model_train).
+    preds = blend_final_points(preds, floors, np.array(gws), ceils)
     # Sample final points for every team and tally who tops the table each sim.
     samples = np.random.normal(preds[:, None], std, size=(len(teams), n_sims))
     samples = np.clip(samples, floors[:, None], ceils[:, None])

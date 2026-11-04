@@ -32,7 +32,8 @@ from sklearn.preprocessing import StandardScaler
 from tensorflow.keras.callbacks import EarlyStopping
 
 from .model_train import (
-    FEATURES, MAX_GAMEWEEK, build_model, build_sequences, calibrate_residual_std,
+    FEATURES, MAX_GAMEWEEK, blend_final_points, build_model, build_sequences,
+    calibrate_residual_std,
 )
 from .paths import OUTPUTS_DIR, TRAINING_FILE, ensure_dirs
 
@@ -54,15 +55,17 @@ def simulate_title_probs(model, scaler, season_df: pd.DataFrame, gameweek: int,
     """
     gw_df = season_df[season_df["gameweek"] <= gameweek]
     teams = list(gw_df["teamName"].unique())
-    seqs, floors, ceils = [], [], []
+    seqs, floors, ceils, gws = [], [], [], []
     for t in teams:
         tdf = gw_df[gw_df["teamName"] == t].sort_values("gameweek")
         seqs.append(_pad(scaler.transform(tdf[FEATURES])))
         latest = tdf.iloc[-1]
         floors.append(float(latest["points"]))
         ceils.append(float(latest["max_obtainable_points"]))
+        gws.append(int(latest["gameweek"]))
     preds = model.predict(np.stack(seqs), verbose=0).ravel()
     floors, ceils = np.array(floors), np.array(ceils)
+    preds = blend_final_points(preds, floors, np.array(gws), ceils)  # pace-anchored
     s = max(float(std), 1e-6)
     samples = np.clip(np.random.normal(preds[:, None], s, (len(teams), n_sims)),
                       floors[:, None], ceils[:, None])
@@ -89,16 +92,17 @@ def run_cv(k: int = 5, eval_gws=EVAL_GAMEWEEKS, epochs: int = 40, seed: int = 42
 
     records = []
     for fi, test_seasons in enumerate(folds, 1):
-        train_df = df[~df["season"].isin(test_seasons)].copy()
-        scaler = StandardScaler()
-        train_df[FEATURES] = scaler.fit_transform(train_df[FEATURES])
-        X, y, cutoffs = build_sequences(train_df, FEATURES)
+        train_raw = df[~df["season"].isin(test_seasons)].copy()
+        scaler = StandardScaler().fit(train_raw[FEATURES])
+        train_scaled = train_raw.copy()
+        train_scaled[FEATURES] = scaler.transform(train_raw[FEATURES])
+        X, y, cutoffs, anchors = build_sequences(train_scaled, FEATURES, anchor_df=train_raw)
         model = build_model(X.shape[1], X.shape[2])
         model.fit(
             X, y, validation_split=0.15, epochs=epochs, batch_size=32, verbose=0,
             callbacks=[EarlyStopping(patience=6, restore_best_weights=True, monitor="val_loss")],
         )
-        resid_std = calibrate_residual_std(model, X, y, cutoffs)
+        resid_std = calibrate_residual_std(model, X, y, cutoffs, anchors)
 
         for s in test_seasons:
             sdf = df[df["season"] == s]  # unscaled — simulate_title_probs scales internally
