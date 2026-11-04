@@ -35,21 +35,31 @@ MAX_GAMEWEEK = 38
 # This fixed both failure modes held-out CV exposed: the LSTM's mid-season hot-streak
 # overshoot (GW15-30) and a fixed blend's GW1 nonsense. TAU=6 centres the handover
 # around GW6 and matches the ~0.4 average LSTM weight the fixed-weight sweep preferred.
-BLEND_TAU = 6.0
+BLEND_TAU = 9.0
+
+# Regression-to-the-mean on the pace projection. A team's points-per-game is shrunk
+# toward the league average with PACE_PRIOR_GAMES pseudo-games, so a hot 5-game run is
+# not extrapolated linearly across the whole season. This is what football actually does
+# (extreme early paces regress), and it damps the week-to-week swings the raw projection
+# caused — strong shrinkage early (few real games), fading as the sample grows.
+PACE_PRIOR_GAMES = 12.0
+LEAGUE_MEAN_PPG = 1.37  # ~52 pts over 38 games, the long-run league average
 
 
 def blend_final_points(lstm_pred, points, gameweek, max_obtainable):
     """
-    Blend the LSTM final-points forecast with a current-pace projection, weighting the
-    pace term by gw/(gw+TAU) so it earns trust as games accumulate. Accepts scalars or
-    numpy arrays. `gameweek` is games played; games_remaining and points-per-game come
-    from the current table, so the anchor is leak-free.
+    Blend the LSTM final-points forecast with a regressed current-pace projection,
+    weighting the pace term by gw/(gw+TAU) so it earns trust as games accumulate.
+    Accepts scalars or numpy arrays. `gameweek` is games played; games_remaining and
+    points-per-game come from the current table, so the anchor is leak-free.
     """
     import numpy as _np
     points = _np.asarray(points, dtype=float)
     gw = _np.maximum(_np.asarray(gameweek, dtype=float), 1.0)
     games_remaining = _np.maximum((_np.asarray(max_obtainable, dtype=float) - points) / 3.0, 0.0)
-    pace_proj = points + (points / gw) * games_remaining
+    # Shrink points-per-game toward the league mean (regression to the mean).
+    ppg = (points + PACE_PRIOR_GAMES * LEAGUE_MEAN_PPG) / (gw + PACE_PRIOR_GAMES)
+    pace_proj = points + ppg * games_remaining
     pace_w = gw / (gw + BLEND_TAU)
     return (1.0 - pace_w) * _np.asarray(lstm_pred, dtype=float) + pace_w * pace_proj
 
