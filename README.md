@@ -1,9 +1,10 @@
 # Premier League Title Prediction
 
 An LSTM model that estimates each club's probability of winning the Premier League
-title, updated week-by-week through the season. Outputs are **Kalshi-style
-percentages** — one probability per team per gameweek, softmaxed across the 20 clubs
-so they always sum to 100%.
+title, updated week-by-week through the season. The model predicts each club's
+**final-season points** from its form so far; title odds are the share of **20,000
+simulated season-endings** in which a club finishes top — **Kalshi-style percentages**,
+one per team per gameweek, summing to 100%.
 
 ![Title race animation](outputs/title_race.gif)
 
@@ -33,15 +34,26 @@ Each row is a team's state after their Nth game of the season.
 negative otherwise), `max_obtainable_points` (`points + games_remaining × 3`, the
 title ceiling).
 
-**Pre-season priors** — the signals that make gameweek-1 odds realistic before any
-results exist:
-- **`prev_position`** — the team's final league position last season (promoted /
-  previously-absent teams get 21). A clean prior for *every* team, not just
-  champions.
-- **`elo`** — a results-based strength rating that also carries a **squad market
-  value** seed (both below).
+**Performance** — `shot_att` and `shot_def`: rolling (last-5) chance quality a team
+**creates** vs **concedes** (shots on target weighted over total shots). Split into
+separate attacking and defensive signals so the model can value a mean defence on its
+own, not just a net shot differential.
 
-### Elo — results-based, with prestige seeding
+**Strength of schedule** — `sos_played` and `sos_remaining`: the average Elo of the
+opponents a team has already faced vs those still to come (remaining fixtures derived
+from the double round-robin), centred on the league mean. Distinguishes points earned
+against a brutal run from the same points against a soft one.
+
+**Pre-season priors** — the signals that make gameweek-1 odds realistic before any
+results exist. They are **direct features**, so the model *learns* their weight:
+- **`prev_position`** — the team's final league position last season (promoted /
+  previously-absent teams get 21). A clean prior for *every* team, not just champions.
+- **`squad_value_z`** — within-season z-score of log squad market value (below).
+- **`trophy_score`** — stacked prestige of the trophies the club won the previous
+  season (PL/CL/EL/FA/League Cup/ECL).
+- **`elo`** — a **pure results-based** strength rating (below).
+
+### Elo — pure results
 The Elo is a proper chained rating updated after **every match** across all history,
 like [clubelo](http://clubelo.com/) / FiveThirtyEight:
 
@@ -51,29 +63,18 @@ delta         = K × goal_diff_multiplier × (result − expected_home)
 elo_home += delta ;  elo_away −= delta
 ```
 
-Because it only ever sees match results, it is **completely competition-agnostic** —
-a team is never penalised for playing in more competitions.
+It only ever sees match results — **no prestige seeding**. At each season's start a
+team's rating is a plain mean-reverted carryover, `1500 + 0.85 × (prev_end_elo − 1500)`;
+new/promoted teams enter at `1425`. The prestige context (squad value, trophies, last
+year's finish) used to be *added into* this seed as hand-picked bonuses, which made the
+weight of those priors a human guess. They are now **separate model features**
+(`squad_value_z`, `trophy_score`, `prev_position`), so the LSTM learns how much each is
+worth and Elo stays a clean, competition-agnostic measure of on-pitch results.
 
-The context you *do* want — squad market value, European pedigree and trophies — is
-folded in **additively** at the start of each season, on top of the mean-reverted
-carryover:
-
-```
-season_start_elo = 1500 + 0.75 × (prev_end_elo − 1500)      # mean reversion
-                 + value_bonus(this_season)                 # squad market value (below)
-                 + european_qualification_bonus(prev_finish) # >0 even with no trophies
-                 + trophy_bonus(prev_season)                 # stacks per trophy
-```
-
-- **Squad-value bonus** — see the dedicated section below.
-- **European qualification bonus** rewards finishing high enough to reach Europe on
-  its own: CL (~top 5) `+40`, EL (~6th) `+25`, ECL (~7th) `+15`.
-- **Trophy bonus** stacks per trophy won: PL `+50`, CL `+50`, EL `+30`, FA `+20`,
-  League Cup `+15`, ECL `+15`.
-
-Every term is additive, so being in more competitions — or winning more of them —
-can only ever *raise* a team's Elo. All constants live at the top of
-[`src/prem_prediction/elo.py`](src/prem_prediction/elo.py) for tuning.
+The three Elo constants are **fitted, not hand-set**: `fit_elo_params()` grid-searches
+`K`, `HOME_ADVANTAGE` and `SEASON_REGRESSION` for the lowest one-step match-prediction
+Brier over all PL history (→ `K=12`, `HFA=65`, `REG=0.85`). All constants live at the
+top of [`src/prem_prediction/elo.py`](src/prem_prediction/elo.py).
 
 ### Squad market value — the pre-season prior that makes GW1 realistic
 Total squad market value is the single strongest predictor of where a club finishes,
@@ -84,10 +85,10 @@ without it, every team starts a season clustered near 5% (a 20:1 field), which i
 nonsense.
 
 Values are scraped from **Transfermarkt** (`squad_value.py` → `data/squad_values.csv`,
-2005-present) and folded into the Elo seed as:
+2005-present) and fed to the model as `squad_value_z`:
 
 ```
-value_bonus = 80 × z          where z = within-season z-score of log(squad value)
+squad_value_z = z          where z = within-season z-score of log(squad value)
 ```
 
 Two deliberate choices:
@@ -95,39 +96,35 @@ Two deliberate choices:
   to decades of transfer-fee inflation — a 2008 squad and a 2026 squad are scored on
   the same relative scale, against their own peers.
 - **The log** tames the heavy right tail (a handful of super-clubs) so the spread is
-  roughly symmetric. Top squads land ~`+150` Elo, the cheapest ~`−140`.
+  roughly symmetric.
 
-Seasons before ~2005 (no data) get `0`, so Elo stays defined for all history while
-training still benefits from the modern, value-aware seasons.
+Seasons before ~2005 (no data) get `0`. Because it is a direct feature rather than an
+Elo seed, the LSTM sets its own weight on it.
 
-**Effect on GW1 odds** (2026-27, favourites): before squad value the field was almost
-flat (Arsenal 7%, Brentford 5.4%); after, it reads like a real book — Arsenal ~33%
-(3:1), Man City ~29% (3:1), Brentford out at ~26:1, promoted sides ~0%.
-
-> **Why this replaced the old formula.** The previous "elo" divided trophies won by
-> the number of competitions entered. Reaching Europe raised that denominator, so a
-> side strong enough to qualify got a *lower* prior than an identical non-European
-> trophy winner — it punished teams for being in more competitions. It also
-> multiplied by `100 / current_position`, which just duplicated the `position`
-> feature. Both problems are gone.
-
-### Model
-A two-layer LSTM with masking and dropout:
+### Model — predict the table, simulate the title
+A two-layer LSTM with masking and dropout predicts each club's **final-season points**:
 
 ```
-Masking → LSTM(64) → Dropout(0.3) → LSTM(32) → Dropout(0.3) → Dense(1)
+Masking → LSTM(64) → Dropout(0.3) → LSTM(32) → Dropout(0.3) → Dense(1)   # final points
 ```
 
-The output is a **raw logit** (no sigmoid). At prediction time the 20 teams' logits
-are collected and passed through **softmax together**, so the model learns a 20-way
-ranking (only one team can win) rather than 20 independent binaries. Trained with
-`BinaryCrossentropy(from_logits=True)`.
+Trained as a regression (`Huber` loss) on the `final_points` target. Why points and not
+a win/lose label: the model learns *what makes the standings*, and title odds fall out
+of the predicted table rather than being the only thing it can say.
 
-**Partial-sequence training:** sequences are cut at gameweeks 1, 2, 3, 5, 10, … 38
-and zero-padded, so the model makes confident calls at every stage. The early cutoffs
-(1-3) are what teach it to lean on the pre-season priors — without them a GW1 sequence
-is out-of-distribution and the model falls back to a near-uniform guess no prior can
-pierce.
+**From points to title odds.** The raw forecast is blended with a simple current-pace
+projection (`points + ppg × games_remaining`), weighted `gw / (gw + 6)` so the LSTM's
+pre-season priors lead early and the pace anchor takes over by mid-season. Each team's
+final total is then sampled `N(blended_forecast, σ[gw])` — clipped to `[points already
+earned, max still obtainable]` — and the **title probability is the fraction of 20,000
+simulations in which that team finishes top**. `σ[gw]` is the model's own out-of-season
+error at each stage (`±12` pts at GW1, `±1` by GW38), so the odds sharpen as the season
+runs out.
+
+**Partial-sequence training:** sequences are cut at gameweeks 1, 2, 3, 5, 10, … 38 and
+zero-padded, so the model makes confident calls at every stage. The early cutoffs (1-3)
+are what teach it to lean on the pre-season priors — without them a GW1 sequence is
+out-of-distribution.
 
 ---
 
@@ -146,42 +143,49 @@ the season in progress and compares it, gameweek by gameweek, to our own probabi
 Two choices keep the comparison fair:
 - **Normalisation.** Each club is its own binary market, so the 20 YES prices don't sum
   to 100% (≈97% early in 2026-27). Each day is renormalised to a proper distribution
-  before it's compared to the model's softmax.
+  before it's compared to the model's simulated title odds.
 - **Alignment.** The model updates per gameweek; the market trades continuously. Each
   gameweek is matched to the date the round finished, and Kalshi is sampled at its last
   quote on or before that date — so both sides use only what they knew at the time.
 
-**Through GW5 the two broadly agree** on the shape of the race — a two-horse Arsenal/City
-lead, Liverpool a distant third, everyone else near zero:
+### Week by week (2026-27, model `M` vs Kalshi `K`)
 
-| Team | Model (GW5) | Kalshi (GW5) |
-|---|---:|---:|
-| Arsenal | 41.4% | 44.0% |
-| Man City | 44.0% | 36.7% |
-| Liverpool | 8.7% | 3.7% |
-| Chelsea | 0.5% | 4.6% |
-| Brighton | 2.0% | 2.8% |
+| GW | Arsenal (M / K) | Man City (M / K) | Liverpool (M / K) | Model leader | Kalshi leader |
+|---:|---|---|---|---|---|
+| 1 | 27% / 46% | 28% / 19% | 5% / 9% | Man City | Arsenal |
+| 2 | 44% / 44% | 42% / 20% | 1% / 4% | Arsenal | Arsenal |
+| 3 | 51% / 47% | 44% / 22% | 2% / 6% | Arsenal | Arsenal |
+| 4 | 53% / 54% | 46% / 30% | 0% / 4% | Arsenal | Arsenal |
+| 5 | 21% / 44% | 74% / 37% | 2% / 4% | Man City | Arsenal |
+| 6 | 17% / 62% | 82% / 22% | 0% / 4% | Man City | Arsenal |
+| 7 | 19% / 56% | 79% / 21% | 0% / 5% | Man City | Arsenal |
+| 8 | 47% / 66% | 51% / 17% | 1% / 5% | Man City | Arsenal |
+| 9 | **73% / 68%** | 23% / 13% | 0% / 5% | Arsenal | Arsenal |
 
-### The one big divergence is off the pitch — and the model can't see it
+> This table is a snapshot; the animation above and `dashboard.html` (now with a
+> Model / Kalshi / Edge column) regenerate every gameweek.
 
-The model rates **Manchester City** the joint-favourite; the market is markedly cooler on
-them, and the reason has nothing to do with football. In February 2023 the Premier League
-charged City with **115 alleged breaches** of its financial rules covering 2009–2018 (80
-financial breaches plus 35 counts of failing to cooperate). In September 2026 an
-independent commission **reportedly found the club in breach on 114 of the 115 charges**;
-no sanction has been set, and City are expected to appeal, but the market is pricing the
-risk of a **points deduction**.
+The two agree on the **shape** of the race throughout — a two-horse Arsenal/City lead,
+everyone else near zero — and by GW9 they agree on the favourite too (model Arsenal 73%,
+market 68%). The interesting stretch is **GW5–8**, where the model swung hard to City
+(up to 82%) while the market held firm on Arsenal.
 
-The timing makes the point cleanly. The verdict landed on **25 September — after GW5** — and
-Kalshi repriced City from **~38% to ~24%** in a single day, pushing Arsenal from **~48% to
-~61%**. The model didn't move and won't: legal risk is not one of its inputs (it sees only
-results, squad value and shot performance). It will mark City down *only* if their results
-start to slip.
+### Where they diverge — the model is a pure on-pitch read
+
+The model chased City's **mid-season form**: across GW5–8 City were dominating the
+underlying numbers (shots, chances, goal margin), so the final-points forecast projected
+them to overhaul Arsenal. The market never followed, for a reason the model has no feature
+for. In February 2023 the Premier League charged City with **115 alleged breaches** of its
+financial rules (2009–2018); in September 2026 an independent commission **reportedly found
+the club in breach on 114 of the 115 charges** — no sanction set, an appeal expected, but
+the market is pricing the risk of a **points deduction**. So Kalshi kept City suppressed
+(~13–37%) even while City were winning on the pitch, and by GW9 — as Arsenal's lead held
+and City dropped points — the model reconverged on Arsenal.
 
 This is exactly the model's boundary. It's a strong read of on-pitch information, but a
-market will always fold in exogenous shocks — legal rulings, injuries, managerial changes —
-that a results-and-value model has no feature for. The Kalshi overlay is kept precisely so
-that gap is visible rather than hidden.
+market folds in exogenous shocks — legal rulings, injuries, managerial changes — that a
+results-based model cannot see. The Kalshi overlay is kept precisely so that gap is visible
+rather than hidden.
 
 *Sources: [beIN Sports, 25 Sep 2026](https://www.beinsports.com/en-us/soccer/premier-league/articles/manchester-city-receives-verdict-on-115-premier-league-charges-2026-09-25);
 [Yahoo Sports — the 115 charges explained](https://sports.yahoo.com/articles/man-city-115-charges-key-161032453.html).*
@@ -193,12 +197,14 @@ that gap is visible rather than hidden.
 ```
 src/prem_prediction/     # the package
   data_acquisition.py    #   download fixtures, build standings
-  elo.py                 #   results-based Elo + squad-value / prestige seeding
+  elo.py                 #   pure results-based Elo (fitted K/HFA/regression)
   squad_value.py         #   Transfermarkt squad-value scraper
   trophy_data.py         #   historical trophy winners + bonus values
-  prepare_model_data.py  #   form, labels, relative features, prev_position, Elo merge
-  model_train.py         #   LSTM training
-  season_predict.py      #   current-season Kalshi predictions → predictions.json
+  match_stats.py         #   shot_att / shot_def (chances created vs conceded)
+  schedule_strength.py   #   sos_played / sos_remaining (opponent-Elo schedule strength)
+  prepare_model_data.py  #   features, priors, final_points target, Elo/shot/SOS merge
+  model_train.py         #   final-points LSTM + per-gameweek residual-std calibration
+  season_predict.py      #   final-points → simulated title odds → predictions.json
   kalshi.py              #   pull + align the live Kalshi title market (free API)
   evaluate.py            #   grouped-season CV of the title ranking
   viz.py                 #   title_race.gif + model_vs_kalshi.gif + dashboard.html
@@ -207,9 +213,9 @@ src/prem_prediction/     # the package
   update.py              #   gameweek refresh (predict + viz)
   config.py / paths.py   #   season detection, filesystem paths
 scripts/update.py        # thin wrapper: python scripts/update.py
-data/                    # matches, standings, out.csv, squad_values.csv
-models/                  # best_model.h5, scaler.joblib
-outputs/                 # predictions.json, title_race.gif, dashboard.html, evaluation.json
+data/                    # matches, standings, out.csv, squad_values.csv, kalshi_current.csv
+models/                  # best_model.h5, scaler.joblib, point_residual_std.json
+outputs/                 # predictions.json, title_race.gif, model_vs_kalshi.gif, dashboard.html, evaluation.json
 ```
 
 The current season is detected automatically from the date (`config.current_season_start_year`),
@@ -267,9 +273,8 @@ Team names must match the football-data.co.uk convention exactly
 
 ## Evaluation
 
-`val_loss` during training is per-team sigmoid BCE on a leaky random split — not the
-metric we ship. `evaluate.py` scores the actual product (the softmax title ranking) on
-**held-out whole seasons** (grouped k-fold, no sequence leaks), against a trivial
+The shipped product is the **simulated title ranking**, so `evaluate.py` scores exactly
+that on **held-out whole seasons** (grouped k-fold, no sequence leaks), against a trivial
 "current league leader wins" baseline:
 
 ```bash
@@ -281,21 +286,36 @@ uniform guess = 5%):
 
 | GW | model top-1 | leader top-1 | champ log-loss | champ prob |
 |---:|---:|---:|---:|---:|
-| 1 | **0.21** | 0.09 | 1.83 | **19.1%** |
-| 19 | **0.64** | 0.58 | 1.06 | 53.5% |
-| 30 | 0.82 | 0.79 | 0.54 | 72.4% |
-| 38 | 0.90 | 1.00 | 0.30 | 78.5% |
+| 1 | **0.27** | 0.09 | 2.19 | 14.8% |
+| 10 | **0.52** | 0.45 | 1.36 | 36.6% |
+| 19 | **0.61** | 0.58 | 1.02 | 46.4% |
+| 30 | 0.79 | 0.79 | 0.43 | 71.3% |
+| 38 | 1.00 | 1.00 | 0.00 | 100% |
+| **all** | **0.63** | 0.60 | **0.97** | — |
 
-The model does its real work **early**, where a market has value: at GW1 it puts 19%
-on the eventual champion (vs 5% uniform) and ranks them first more than twice as often
-as reading the table. Mid-to-late it edges then ties the trivial baseline — the ceiling
-of the problem, since once ~25 games are played "who's top" is already near-perfect.
+The model **beats the "back the leader" baseline overall** (top-1 0.63 vs 0.60, log-loss
+0.97) and never falls below it at any gameweek. Its edge is biggest **early**, where a
+market has value — at GW1 it ranks the eventual champion first three times as often as
+reading the table (0.27 vs 0.09). Mid-to-late it matches the baseline, which is the
+ceiling of the problem: once ~25 games are played, "who's top" is already near-decisive.
+
+> **Earlier design.** The model previously output a per-team logit passed through a
+> softmax, trained as a binary "won the league" classifier, with the priors hard-coded
+> into the Elo seed. The current table-regression + simulation approach (priors as
+> learned features, pace-anchored) is better calibrated (log-loss 0.97 vs 1.10) and more
+> intuitive — it predicts the standings, and the title odds fall out of them.
 
 ## Automated Weekly Refresh
 
-A scheduled cloud agent can run the refresh for you every week and push the updated
-graph to the repo. It needs GitHub connected to your Claude account
-(`/web-setup` or https://claude.ai/connect-github) and the code pushed to `main`.
+A scheduled **cloud agent** runs the refresh every week and pushes the updated
+predictions, graphs and dashboard to `main` — no local machine involved. It currently
+fires **Tuesdays at 13:00 UTC** (after the weekend/midweek rounds): it installs deps,
+runs `python -m prem_prediction.update` (re-score only — it does **not** retrain), and
+commits `outputs/` if anything changed.
+
+Set one up (or change the schedule) with the `/schedule` command in Claude Code; it needs
+GitHub connected to your Claude account (`/web-setup` or https://claude.ai/connect-github)
+and the code on `main`.
 
 ---
 
